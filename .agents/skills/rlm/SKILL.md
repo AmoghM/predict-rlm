@@ -9,7 +9,7 @@ description: >
 compatibility: Requires Python 3.11+, Deno, and the predict-rlm package (built on DSPy).
 metadata:
   author: Emile Riberdy
-  version: "2.0"
+  version: "2.1"
 ---
 
 # Build an RLM
@@ -801,6 +801,68 @@ PredictRLM(
 Both `lm` and `sub_lm` accept a model string (e.g. `"openai/gpt-5.4"`) or a
 `dspy.LM` instance. If `lm` is omitted, the current context LM from
 `dspy.context(lm=...)` is used.
+
+## CodexLM / ChatGPT subscription backend
+
+Starting in `predict-rlm` v0.7.0, `predict-rlm[codex-lm]` includes
+`dspy_codex_lm.CodexLM`, a DSPy LM backed by the Codex/ChatGPT subscription
+backend. Use it when the user wants PredictRLM to run on Codex model slugs
+through ChatGPT/Codex auth instead of normal OpenAI API keys.
+
+Install and authenticate:
+
+```bash
+uv add "predict-rlm[codex-lm]"
+uv run codex-lm auth login default
+uv run codex-lm auth status
+uv run codex-lm smoke-test --model gpt-5.5
+```
+
+For prerelease builds, allow prereleases explicitly:
+
+```bash
+uv add --prerelease=allow "predict-rlm[codex-lm]==0.7.0-alpha0"
+```
+
+Use `CodexLM` directly when wiring `lm` or `sub_lm`:
+
+```python
+from dspy_codex_lm import CodexLM
+from predict_rlm import PredictRLM
+
+rlm = PredictRLM(
+    MySignature,
+    lm=CodexLM(model="gpt-5.5"),
+    sub_lm=CodexLM(model="gpt-5.5"),
+)
+```
+
+To run an existing DSPy script without editing its LM construction, use the CLI
+wrapper. It monkeypatches OpenAI-family `dspy.LM(...)` calls and routes supported
+Codex model slugs to `CodexLM`:
+
+```bash
+uv run codex-lm my_dspy_script.py
+```
+
+Useful CLI commands:
+
+```bash
+uv run codex-lm --help
+uv run codex-lm auth list
+uv run codex-lm usage
+uv run codex-lm rotation on
+```
+
+Important caveats:
+
+- CodexLM uses Codex/ChatGPT subscription auth, not ordinary OpenAI API keys.
+- Routing is strict: OpenAI-family model strings are intercepted only when the
+  slug is a supported Codex model; unsupported OpenAI-family slugs raise an
+  error instead of silently falling back.
+- Common supported slugs include `gpt-5.1-codex`, `gpt-5.1-codex-max`,
+  `gpt-5.1-codex-mini`, `gpt-5.2`, `gpt-5.2-codex`, `gpt-5.3-codex`,
+  `gpt-5.3-codex-spark`, `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.5`.
 
 ## Skill dataclass
 
