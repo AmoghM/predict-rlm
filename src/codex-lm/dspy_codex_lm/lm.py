@@ -175,6 +175,31 @@ def _install_pydantic_warning_filter() -> None:
 _install_pydantic_warning_filter()
 
 
+def _disable_litellm_stream_logging(stream: Any) -> Any:
+    """Keep LiteLLM stream logging from reassembling Codex responses.
+
+    CodexLM consumes the stream, assembles the final ResponsesAPIResponse, and
+    fires DSPy's usage tracker itself. Recent LiteLLM versions try to do a
+    second private logging pass on ``response.completed`` and can receive a
+    dict-shaped ``response`` from the Codex backend, which raises before
+    CodexLM can assemble the result.
+    """
+
+    def noop(*args, **kwargs):
+        return None
+
+    for name in (
+        "_handle_logging_completed_response",
+        "_handle_logging_failed_response",
+    ):
+        if hasattr(stream, name):
+            try:
+                setattr(stream, name, noop)
+            except Exception:
+                pass
+    return stream
+
+
 class CodexStreamError(RuntimeError):
     """Raised when the Codex response stream emits a failure event (rate
     limit, backend error, incomplete response) or ends without ever
@@ -492,6 +517,7 @@ class CodexLM(dspy.LM):
                         num_retries=num_retries,
                         **request,
                     )
+                    stream = _disable_litellm_stream_logging(stream)
                     state = self._fresh_state()
                     for event in _iter_stream_with_heartbeat(stream):
                         self._handle_event(event, state)
@@ -526,6 +552,7 @@ class CodexLM(dspy.LM):
                         num_retries=num_retries,
                         **request,
                     )
+                    stream = _disable_litellm_stream_logging(stream)
                     state = self._fresh_state()
                     async for event in _aiter_stream_with_heartbeat(stream):
                         self._handle_event(event, state)

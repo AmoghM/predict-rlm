@@ -24,6 +24,34 @@ def test_forward_single_call(lm):
     assert resp.usage.cost > 0
 
 
+def test_forward_disables_litellm_stream_logging(lm):
+    class StreamWithLitellmLogging:
+        def __init__(self, events):
+            self._events = iter(events)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self):
+            event = next(self._events)
+            if event.type == "response.completed":
+                self._handle_logging_completed_response()
+            return event
+
+        def _handle_logging_completed_response(self):
+            raise AssertionError("LiteLLM stream logging should be disabled")
+
+    events = build_stream_events("ok", input_tokens=10, output_tokens=2)
+
+    def fake(**_):
+        return StreamWithLitellmLogging(events)
+
+    with mock.patch("dspy_codex_lm.lm.litellm.responses", side_effect=fake):
+        resp = lm.forward(prompt="ping", cache=False)
+
+    assert resp.output[0].content[0].text == "ok"
+
+
 def test_forward_via_dspy_predict(lm):
     text = "[[ ## answer ## ]]\n4\n[[ ## completed ## ]]"
     events = build_stream_events(text, input_tokens=50, output_tokens=10)
