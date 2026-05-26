@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import random
 import uuid
 import warnings
 from dataclasses import dataclass
@@ -199,6 +200,7 @@ class _AuthCredentials:
 class _AuthConfigSnapshot:
     credentials: tuple[_AuthCredentials, ...] = ()
     error: Exception | None = None
+    rotating: bool = False
 
 
 class CodexLM(dspy.LM):
@@ -233,7 +235,6 @@ class CodexLM(dspy.LM):
         )
         self._auth_config_snapshot: _AuthConfigSnapshot | None = None
         self._auth_config_snapshot_at: float | None = None
-        self._auth_config_cursor = 0
         if access_token is None or account_id is None:
             if auth_path is not None or auth_profile is not None:
                 access_token, account_id = load_codex_auth(
@@ -302,9 +303,11 @@ class CodexLM(dspy.LM):
             raise snapshot.error
         if not snapshot.credentials:
             raise FileNotFoundError("no codex-lm auth credentials available")
-        index = self._auth_config_cursor % len(snapshot.credentials)
-        credentials = snapshot.credentials[index]
-        self._auth_config_cursor = (index + 1) % len(snapshot.credentials)
+        credentials = (
+            random.choice(snapshot.credentials)
+            if snapshot.rotating
+            else snapshot.credentials[0]
+        )
         return credentials.access_token, credentials.account_id
 
     def _cached_auth_config_snapshot(self) -> _AuthConfigSnapshot:
@@ -321,15 +324,13 @@ class CodexLM(dspy.LM):
 
     def _refresh_auth_config_snapshot(self, now: float) -> None:
         try:
-            snapshot, cursor = self._load_auth_config_snapshot()
+            snapshot = self._load_auth_config_snapshot()
         except Exception as exc:
             snapshot = _AuthConfigSnapshot(error=exc)
-            cursor = 0
         self._auth_config_snapshot = snapshot
         self._auth_config_snapshot_at = now
-        self._auth_config_cursor = cursor
 
-    def _load_auth_config_snapshot(self) -> tuple[_AuthConfigSnapshot, int]:
+    def _load_auth_config_snapshot(self) -> _AuthConfigSnapshot:
         source = resolve_auth_source(
             self._auth_path,
             profile=self._auth_profile,
@@ -337,25 +338,21 @@ class CodexLM(dspy.LM):
         )
         if source.source != "rotation":
             access_token, account_id = load_codex_auth(source.path)
-            return (
-                _AuthConfigSnapshot(credentials=(_AuthCredentials(access_token, account_id),)),
-                0,
+            return _AuthConfigSnapshot(
+                credentials=(_AuthCredentials(access_token, account_id),),
             )
 
         credentials = []
-        cursor = 0
-        for index, profile in enumerate(list_enabled_auth_profiles()):
+        for profile in list_enabled_auth_profiles():
             access_token, account_id = load_codex_auth(profile_auth_path(profile))
             credentials.append(_AuthCredentials(access_token, account_id))
-            if profile == source.profile:
-                cursor = index
         if not credentials:
             raise ValueError(
                 "auth profile rotation is enabled but no enabled auth profiles "
                 "are available; run `codex-lm auth enable NAME` or "
                 "`codex-lm rotation off`"
             )
-        return _AuthConfigSnapshot(credentials=tuple(credentials)), cursor
+        return _AuthConfigSnapshot(credentials=tuple(credentials), rotating=True)
 
     def _fresh_state(self) -> dict[str, Any]:
         return {

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -176,13 +177,7 @@ def set_auth_rotation_enabled(enabled: bool) -> dict[str, Any]:
                 "no enabled auth profiles available; run "
                 "`codex-lm auth enable NAME` before enabling rotation"
             )
-        state = _read_rotation_state()
-        cursor = _coerce_cursor(state.get("cursor", 0))
-        next_state = {
-            "enabled": enabled,
-            "cursor": cursor % len(enabled_profiles) if enabled_profiles else 0,
-        }
-        _write_rotation_state(next_state)
+        _write_rotation_state({"enabled": enabled})
         return {
             "enabled": enabled,
             "profile_count": len(enabled_profiles),
@@ -210,15 +205,7 @@ def _rotation_auth_source(*, advance: bool) -> AuthSource | None:
                 "are available; run `codex-lm auth enable NAME` or "
                 "`codex-lm rotation off`"
             )
-        index = _coerce_cursor(state.get("cursor", 0)) % len(profiles)
-        profile = profiles[index]
-        if advance:
-            _write_rotation_state(
-                {
-                    "enabled": True,
-                    "cursor": (index + 1) % len(profiles),
-                }
-            )
+        profile = random.choice(profiles) if advance else profiles[0]
         return AuthSource(profile.auth_path, profile.name, "rotation")
 
 
@@ -502,25 +489,19 @@ def _write_auth_json(path: Path, data: dict[str, Any]) -> None:
 def _read_rotation_state() -> dict[str, Any]:
     path = rotation_state_path()
     if not path.is_file():
-        return {"enabled": False, "cursor": 0}
+        return {"enabled": False}
     try:
         data = _read_json_object(path)
     except (json.JSONDecodeError, OSError, TypeError, ValueError):
-        return {"enabled": False, "cursor": 0}
-    return {
-        "enabled": bool(data.get("enabled", False)),
-        "cursor": _coerce_cursor(data.get("cursor", 0)),
-    }
+        return {"enabled": False}
+    return {"enabled": bool(data.get("enabled", False))}
 
 
 def _write_rotation_state(state: dict[str, Any]) -> None:
     path = rotation_state_path()
     _ensure_private_dir(path.parent)
     text = json.dumps(
-        {
-            "enabled": bool(state.get("enabled", False)),
-            "cursor": _coerce_cursor(state.get("cursor", 0)),
-        },
+        {"enabled": bool(state.get("enabled", False))},
         indent=2,
         sort_keys=True,
     )
@@ -544,11 +525,6 @@ def _write_rotation_state(state: dict[str, Any]) -> None:
         if tmp_file is not None and tmp_file.exists():
             tmp_file.unlink()
     _chmod_private_file(path)
-
-
-def _coerce_cursor(value: Any) -> int:
-    return value if isinstance(value, int) and value >= 0 else 0
-
 
 @contextmanager
 def _rotation_lock() -> Iterator[None]:

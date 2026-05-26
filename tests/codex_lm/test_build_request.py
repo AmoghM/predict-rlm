@@ -103,7 +103,7 @@ def test_ctor_can_pin_auth_profile(tmp_path, monkeypatch):
     assert headers["ChatGPT-Account-Id"] == "acct-profile"
 
 
-def test_long_lived_lm_rotates_accounts_per_request(tmp_path, monkeypatch):
+def test_long_lived_lm_randomly_selects_accounts_per_request(tmp_path, monkeypatch):
     import json
     from pathlib import Path
     from types import SimpleNamespace
@@ -172,15 +172,29 @@ def test_long_lived_lm_rotates_accounts_per_request(tmp_path, monkeypatch):
 
     monkeypatch.setattr("dspy_codex_lm.lm.litellm.responses", fake_responses)
 
+    random_choices = []
+    selected_accounts = iter(["acct-beta", "acct-alpha"])
+
+    def choose_credentials(credentials):
+        credentials = tuple(credentials)
+        random_choices.append([credential.account_id for credential in credentials])
+        selected = next(selected_accounts)
+        return next(
+            credential for credential in credentials if credential.account_id == selected
+        )
+
+    monkeypatch.setattr("dspy_codex_lm.lm.random.choice", choose_credentials)
+
     lm = CodexLM(model="gpt-5.3-codex")
     lm.forward(prompt="one", cache=False)
     lm.forward(prompt="two", cache=False)
 
     assert [item["ChatGPT-Account-Id"] for item in seen_headers] == [
-        "acct-alpha",
         "acct-beta",
+        "acct-alpha",
     ]
-    assert seen_api_keys == ["alpha-token", "beta-token"]
+    assert seen_api_keys == ["beta-token", "alpha-token"]
+    assert random_choices == [["acct-alpha", "acct-beta"], ["acct-alpha", "acct-beta"]]
 
 
 def test_long_lived_lm_resyncs_disabled_and_reenabled_profiles(tmp_path, monkeypatch):
@@ -227,6 +241,26 @@ def test_long_lived_lm_resyncs_disabled_and_reenabled_profiles(tmp_path, monkeyp
     )
     assert main(["codex-lm", "rotation", "on"]) == 0
 
+    selected_accounts = iter(
+        [
+            "acct-alpha",
+            "acct-beta",
+            "acct-alpha",
+            "acct-beta",
+            "acct-beta",
+            "acct-alpha",
+        ]
+    )
+
+    def choose_credentials(credentials):
+        credentials = tuple(credentials)
+        selected = next(selected_accounts)
+        return next(
+            credential for credential in credentials if credential.account_id == selected
+        )
+
+    monkeypatch.setattr("dspy_codex_lm.lm.random.choice", choose_credentials)
+
     lm = CodexLM(model="gpt-5.3-codex", auth_config_refresh_seconds=60.0)
     _, headers = lm._build_request(prompt="one", messages=None, kwargs={})
     enable_auth_profile("alpha", enabled=False)
@@ -267,7 +301,7 @@ def test_long_lived_lm_resyncs_disabled_and_reenabled_profiles(tmp_path, monkeyp
     ]
 
 
-def test_long_lived_lm_rotates_cached_snapshot_without_auth_reload(
+def test_long_lived_lm_randomly_selects_cached_snapshot_without_auth_reload(
     tmp_path,
     monkeypatch,
 ):
@@ -324,6 +358,19 @@ def test_long_lived_lm_rotates_cached_snapshot_without_auth_reload(
 
     monkeypatch.setattr(lm_module, "load_codex_auth", counting_load_codex_auth)
 
+    random_choices = []
+    selected_accounts = iter(["acct-beta", "acct-alpha", "acct-beta"])
+
+    def choose_credentials(credentials):
+        credentials = tuple(credentials)
+        random_choices.append([credential.account_id for credential in credentials])
+        selected = next(selected_accounts)
+        return next(
+            credential for credential in credentials if credential.account_id == selected
+        )
+
+    monkeypatch.setattr("dspy_codex_lm.lm.random.choice", choose_credentials)
+
     lm = CodexLM(model="gpt-5.3-codex", auth_config_refresh_seconds=60.0)
     first, first_headers = lm._build_request(prompt="one", messages=None, kwargs={})
     second, second_headers = lm._build_request(prompt="two", messages=None, kwargs={})
@@ -337,13 +384,68 @@ def test_long_lived_lm_rotates_cached_snapshot_without_auth_reload(
             third_headers,
         ]
     ] == [
-        "acct-alpha",
         "acct-beta",
         "acct-alpha",
+        "acct-beta",
     ]
     assert [item["api_key"] for item in [first, second, third]] == [
-        "alpha-token",
         "beta-token",
         "alpha-token",
+        "beta-token",
+    ]
+    assert random_choices == [
+        ["acct-alpha", "acct-beta"],
+        ["acct-alpha", "acct-beta"],
+        ["acct-alpha", "acct-beta"],
     ]
     assert len(load_calls) == 2
+
+
+def test_pinned_access_token_bypasses_rotation_random_choice(tmp_path, monkeypatch):
+    import json
+    from pathlib import Path
+
+    from dspy_codex_lm import CodexLM
+    from dspy_codex_lm.auth import import_auth_profile
+    from dspy_codex_lm.cli import main
+
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+
+    def write_auth(path: Path, *, access_token: str, account_id: str) -> Path:
+        path.write_text(
+            json.dumps(
+                {
+                    "tokens": {
+                        "access_token": access_token,
+                        "account_id": account_id,
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    import_auth_profile(
+        "alpha",
+        write_auth(
+            tmp_path / "alpha.json",
+            access_token="alpha-token",
+            account_id="acct-alpha",
+        ),
+    )
+    assert main(["codex-lm", "rotation", "on"]) == 0
+
+    def fail_if_random_choice_used(credentials):
+        raise AssertionError(f"unexpected random rotation from {credentials}")
+
+    monkeypatch.setattr("dspy_codex_lm.lm.random.choice", fail_if_random_choice_used)
+
+    lm = CodexLM(
+        model="gpt-5.3-codex",
+        access_token="pinned-token",
+        account_id="acct-pinned",
+    )
+    request, headers = lm._build_request(prompt="one", messages=None, kwargs={})
+
+    assert request["api_key"] == "pinned-token"
+    assert headers["ChatGPT-Account-Id"] == "acct-pinned"

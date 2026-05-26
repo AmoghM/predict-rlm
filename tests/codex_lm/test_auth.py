@@ -328,9 +328,10 @@ def test_explicit_path_ignores_profile_disabled_state(
     assert load_codex_auth(dest) == ("work-token", "acct-work")
 
 
-def test_rotation_round_robins_saved_profiles_and_wraps(
+def test_rotation_randomly_selects_enabled_saved_profiles(
     fake_home: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys,
 ):
     import_auth_profile(
@@ -354,15 +355,26 @@ def test_rotation_round_robins_saved_profiles_and_wraps(
     assert main(["codex-lm", "rotation", "on"]) == 0
     capsys.readouterr()
 
-    assert load_codex_auth() == ("alpha-token", "acct-alpha")
+    choices: list[list[str]] = []
+
+    def choose_beta(profiles):
+        choices.append([profile.name for profile in profiles])
+        return next(profile for profile in profiles if profile.name == "beta")
+
+    monkeypatch.setattr("dspy_codex_lm.auth.random.choice", choose_beta)
+
     assert load_codex_auth() == ("beta-token", "acct-beta")
-    assert load_codex_auth() == ("alpha-token", "acct-alpha")
+    assert load_codex_auth() == ("beta-token", "acct-beta")
+    assert choices == [["alpha", "beta"], ["alpha", "beta"]]
     assert get_active_profile() == "beta"
+    rotation_state = fake_home / ".codex-lm" / "rotation.json"
+    assert "cursor" not in rotation_state.read_text(encoding="utf-8")
 
 
 def test_rotation_skips_disabled_profiles_and_all_disabled_fails(
     fake_home: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys,
 ):
     import_auth_profile(
@@ -386,8 +398,17 @@ def test_rotation_skips_disabled_profiles_and_all_disabled_fails(
     assert main(["codex-lm", "rotation", "on"]) == 0
     capsys.readouterr()
 
+    choices: list[list[str]] = []
+
+    def choose_only_enabled(profiles):
+        choices.append([profile.name for profile in profiles])
+        return profiles[0]
+
+    monkeypatch.setattr("dspy_codex_lm.auth.random.choice", choose_only_enabled)
+
     assert load_codex_auth() == ("beta-token", "acct-beta")
     assert load_codex_auth() == ("beta-token", "acct-beta")
+    assert choices == [["beta"], ["beta"]]
 
     enable_auth_profile("beta", enabled=False)
 
@@ -421,16 +442,34 @@ def test_rotation_is_bypassed_by_explicit_and_env_profile(
     assert main(["codex-lm", "rotation", "on"]) == 0
     capsys.readouterr()
 
+    random_choices = []
+
+    def choose_alpha(profiles):
+        random_choices.append([profile.name for profile in profiles])
+        return next(profile for profile in profiles if profile.name == "alpha")
+
+    monkeypatch.setattr("dspy_codex_lm.auth.random.choice", choose_alpha)
+
+    explicit = _write_auth(
+        tmp_path / "explicit.json",
+        access_token="explicit-token",
+        account_id="acct-explicit",
+    )
+
+    assert load_codex_auth(explicit) == ("explicit-token", "acct-explicit")
     assert load_codex_auth(profile="beta") == ("beta-token", "acct-beta")
     monkeypatch.setenv(CODEX_LM_AUTH_PROFILE_ENV, "beta")
     assert load_codex_auth() == ("beta-token", "acct-beta")
     monkeypatch.delenv(CODEX_LM_AUTH_PROFILE_ENV)
+    assert random_choices == []
     assert load_codex_auth() == ("alpha-token", "acct-alpha")
+    assert random_choices == [["alpha", "beta"]]
 
 
-def test_rotation_status_metadata_does_not_advance_cursor(
+def test_rotation_status_metadata_does_not_choose_request_profile(
     fake_home: Path,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys,
 ):
     import_auth_profile(
@@ -453,11 +492,15 @@ def test_rotation_status_metadata_does_not_advance_cursor(
     assert main(["codex-lm", "rotation", "on"]) == 0
     capsys.readouterr()
 
+    def fail_if_request_choice_used(profiles):
+        raise AssertionError(f"unexpected request selection from {profiles}")
+
+    monkeypatch.setattr("dspy_codex_lm.auth.random.choice", fail_if_request_choice_used)
+
     metadata = auth_status_metadata()
 
     assert metadata["source"] == "rotation"
     assert metadata["profile"] == "alpha"
-    assert load_codex_auth() == ("alpha-token", "acct-alpha")
 
 
 def test_explicit_path_overrides_env_and_active(

@@ -387,6 +387,9 @@ def test_main_missing_args_returns_usage(restore_lm, capsys):
     assert captured.err == ""
     assert "usage: codex-lm" in captured.out
     assert "codex-lm rotation" in captured.out
+    assert "random" in captured.out
+    assert "round robin" not in captured.out
+    assert "round-robin" not in captured.out
     assert "Supported Codex models:" not in captured.out
 
 
@@ -578,11 +581,13 @@ def test_main_usage_shows_rotation_on_for_saved_profiles(
     lines = captured.out.splitlines()
 
     assert lines[0] == "-" * 60
-    assert lines[1:3] == ["Rotation: on (round robin)", ""]
+    assert lines[1:3] == ["Rotation: on (random)", ""]
     assert "personal:" in captured.out
     assert "work (default):" in captured.out
     assert captured.out.count("5h limit:") == 2
     assert rotation_state.read_text(encoding="utf-8") == state_before
+    assert "round robin" not in captured.out
+    assert "round-robin" not in captured.out
     assert "secret-token" not in captured.out
     assert "acct-secret" not in captured.out
     assert "person@example.com" not in captured.out
@@ -767,12 +772,15 @@ def test_rotation_on_off_status(
     assert main(["codex-lm", "rotation", "on"]) == 0
     captured = capsys.readouterr()
     assert captured.err == ""
-    assert captured.out.strip() == "Rotation: on (round robin)"
+    assert captured.out.strip() == "Rotation: on (random)"
+    rotation_state = fake_home / ".codex-lm" / "rotation.json"
+    assert "cursor" not in rotation_state.read_text(encoding="utf-8")
 
     assert main(["codex-lm", "rotation", "status"]) == 0
     captured = capsys.readouterr()
     assert captured.err == ""
-    assert captured.out.strip() == "Rotation: on (round robin)"
+    assert captured.out.strip() == "Rotation: on (random)"
+    assert "cursor" not in rotation_state.read_text(encoding="utf-8")
 
     assert main(["codex-lm", "rotation", "off"]) == 0
     captured = capsys.readouterr()
@@ -818,12 +826,14 @@ def test_auth_list_shows_rotation_on_and_keeps_default_marker(
     captured = capsys.readouterr()
 
     assert captured.out.splitlines() == [
-        "Rotation: on (round robin)",
+        "Rotation: on (random)",
         "",
         "  personal",
         "* work",
     ]
     assert rotation_state.read_text(encoding="utf-8") == state_before
+    assert "round robin" not in captured.out
+    assert "round-robin" not in captured.out
 
 
 def test_auth_list_and_status_color_can_be_forced(

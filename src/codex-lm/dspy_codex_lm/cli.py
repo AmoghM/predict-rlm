@@ -261,7 +261,7 @@ def _print_main_help(*, file=None, full: bool = True) -> None:
             "Commands:\n"
             "  usage       show redacted usage for saved auth profiles\n"
             "  smoke-test  send a tiny request for saved auth profiles\n"
-            "  rotation    round-robin ordinary requests across saved profiles\n"
+            "  rotation    randomly route ordinary requests across saved profiles\n"
             "  auth        manage saved Codex auth profiles\n"
             "\n"
             "Run `codex-lm --help` for full options.",
@@ -279,7 +279,7 @@ def _print_main_help(*, file=None, full: bool = True) -> None:
         "OpenAI-family LM constructions are routed through CodexLM.\n"
         "Use `codex-lm usage` to print a redacted ChatGPT/Codex usage summary.\n"
         "Use `codex-lm smoke-test` to test saved auth profiles.\n"
-        "Use `codex-lm rotation on` to round-robin ordinary requests across "
+        "Use `codex-lm rotation on` to randomly route ordinary requests across "
         "saved profiles.\n"
         "Use `codex-lm auth` to manage Codex auth profiles.\n"
         "\n"
@@ -389,7 +389,7 @@ def _main_rotation(argv: list[str]) -> int:
 def _format_rotation_status(status: dict[str, object]) -> str:
     if not status.get("enabled"):
         return "Rotation: off"
-    return "Rotation: on (round robin)"
+    return "Rotation: on (random)"
 
 
 def _enabled_rotation_display_line(*, color: bool = False) -> str | None:
