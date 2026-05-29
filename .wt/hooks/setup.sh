@@ -10,11 +10,11 @@ set -euo pipefail
 WORKTREE_PATH="$1"
 RAW_WORKTREE_NAME="$2"
 
-WORKTREE_NAME=$(echo "$RAW_WORKTREE_NAME" | sed 's/^predict-rlm\.//')
+WORKTREE_NAME=$(echo "$RAW_WORKTREE_NAME" | sed -E 's/^predict-rlm[.-]//')
 
 # Detect layout and find main repo
 BASENAME=$(basename "$WORKTREE_PATH")
-if [[ "$BASENAME" == predict-rlm.* ]]; then
+if [[ "$BASENAME" == predict-rlm.* || "$BASENAME" == predict-rlm-* ]]; then
     REL_PATH="../predict-rlm"
 else
     REL_PATH="../.."
