@@ -65,6 +65,7 @@ CODEX_STREAM_WAIT_MAX: float = 8.0
 # hours by default on macOS. 30s comfortably covers slow first-token
 # latency and normal inter-token gaps while keeping stalls observable.
 CODEX_STREAM_HEARTBEAT_SEC: float = 30.0
+DEFAULT_CODEX_MODEL = "gpt-5.5"
 
 logger = logging.getLogger(__name__)
 
@@ -241,7 +242,7 @@ class CodexLM(dspy.LM):
 
     def __init__(
         self,
-        model: str = "gpt-5.3-codex",
+        model: str = DEFAULT_CODEX_MODEL,
         instructions: str = "You are a helpful assistant.",
         access_token: str | None = None,
         account_id: str | None = None,

@@ -77,6 +77,7 @@ CODEX_SUPPORTED_MODELS: frozenset[str] = frozenset(
         "gpt-5.5",
     }
 )
+DEFAULT_CODEX_MODEL = "gpt-5.5"
 
 # Kwargs that CodexLM owns — drop them if passed to the intercepted LM.
 DROPPED_KWARGS = ("api_key", "api_base", "base_url", "model_type", "provider")
@@ -539,7 +540,7 @@ def _main_smoke_test(argv: list[str]) -> int:
 
 def _parse_smoke_test_args(args: list[str]) -> tuple[str | None, str, str]:
     profile = None
-    model = "gpt-5.3-codex"
+    model = DEFAULT_CODEX_MODEL
     prompt = "Reply with OK."
     rest = list(args)
     if rest and not rest[0].startswith("-"):

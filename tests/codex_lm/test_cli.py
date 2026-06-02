@@ -1076,7 +1076,7 @@ def test_smoke_test_checks_only_requested_profile(
     captured = capsys.readouterr()
 
     assert calls == [
-        ("init", "gpt-5.3-codex", "work"),
+        ("init", "gpt-5.5", "work"),
         ("forward", "ping", False),
     ]
     assert "work: ok" in captured.out
