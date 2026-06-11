@@ -67,12 +67,20 @@ class SbxInterpreter(PredictRLMInterpreter):
         self.extra_read_paths = extra_read_paths or []
         self.extra_write_paths = extra_write_paths or []
         self._runner_command = _runner_command
-        self._host_workspace = Path.cwd()
+        # ``staging_root_base`` lets the caller place the bind-mounted staging
+        # dir on a Docker-shareable path (e.g. macOS Docker Desktop only shares
+        # specific host dirs); falls back to the process cwd.
+        self._host_workspace = (
+            Path(self.config.staging_root_base)
+            if self.config.staging_root_base
+            else Path.cwd()
+        )
         self._owns_staging_root = _staging_root is None
         self._staging_root = Path(_staging_root) if _staging_root else (
             self._host_workspace / ".predict_rlm_sbx" / uuid.uuid4().hex
         )
         self._staging_root.mkdir(parents=True, exist_ok=True)
+        self._container_name: str | None = None
         self._proc: subprocess.Popen[str] | None = None
         self._stdout_lines: queue.Queue[str] = queue.Queue()
         self._stdout_reader: threading.Thread | None = None
@@ -208,10 +216,21 @@ class SbxInterpreter(PredictRLMInterpreter):
                 self._proc.wait(timeout=5)
         self._proc = None
 
-        if self._runner_command is None and self._sandbox_name and self.config.remove_on_shutdown:
-            if not self.config.persist:
+        if self._runner_command is None and self.config.remove_on_shutdown and not self.config.persist:
+            if self.config.runtime == "sbx" and self._sandbox_name:
                 subprocess.run(
                     ["sbx", "rm", self._sandbox_name],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            elif self.config.runtime == "docker" and self._container_name:
+                # ``--rm`` removes the container on normal exit; this covers the
+                # graceful-shutdown path and is a no-op if already gone. A
+                # SIGKILLed parent orphans the ``docker run`` client, so callers
+                # that hard-kill must reap by container name themselves.
+                subprocess.run(
+                    ["docker", "rm", "-f", self._container_name],
                     check=False,
                     capture_output=True,
                     text=True,
@@ -236,6 +255,10 @@ class SbxInterpreter(PredictRLMInterpreter):
 
         if self._runner_command is not None:
             command = self._runner_command
+        elif self.config.runtime == "host":
+            command = self._build_host_runner_command()
+        elif self.config.runtime == "docker":
+            command = self._build_docker_runner_command()
         else:
             command = self._start_sbx_and_build_runner_command()
 
@@ -332,6 +355,86 @@ class SbxInterpreter(PredictRLMInterpreter):
             SBX_PYTHON_EXECUTABLE,
             "-u",
             str(runner_path),
+        ]
+
+    def _build_host_runner_command(self) -> list[str]:
+        """Launch the runner as a bare host ``python3`` subprocess.
+
+        No container/isolation. The host ``PREDICT_RLM_SBX_ROOT`` env set in
+        ``_ensure_process`` makes the runner resolve the same staging root, and
+        host-side mount/sync already share that filesystem directly.
+
+        Caveat vs the docker runtime: there is no real ``/sandbox`` mount on the
+        host, so only the runner-patched ``open``/``pathlib`` reach the staging
+        dir for literal ``/sandbox/...`` paths; ``os.*``/``shutil``/``zipfile``
+        on those literal paths do not. Code should use the injected (already
+        resolved) file-path variables, which the docker runtime makes
+        unnecessary by mounting the sandbox at a real ``/sandbox``.
+        """
+        runner_path = self._prepare_runner_script()
+        (self._staging_root / "sandbox").mkdir(parents=True, exist_ok=True)
+        return [self.config.python_executable, "-u", str(runner_path)]
+
+    def _build_docker_runner_command(self) -> list[str]:
+        """Launch the runner inside a plain ``docker run -i`` container.
+
+        The staging root is bind-mounted at its *resolved* host path (and
+        ``PREDICT_RLM_SBX_ROOT`` / ``-w`` use the same), so the absolute paths
+        baked into executed code by ``_map_variable_value`` — which resolves
+        symlinks (e.g. macOS ``/var`` -> ``/private/var``) — match the paths
+        that exist inside the container. Host-side tools (predict, recalc, ...)
+        ride the stdio JSON-RPC pipe, so the container needs no network by
+        default.
+        """
+        if not self.config.image:
+            raise SandboxFatalError(
+                "Docker runtime requires SbxConfig.image (the prebaked runner image)."
+            )
+        if shutil.which("docker") is None:
+            raise SandboxFatalError(
+                "Docker runtime requires the `docker` CLI on PATH and a running daemon."
+            )
+
+        runner_path = self._prepare_runner_script()
+        # ``-w`` is resolved at container start, before the runner's own mkdir.
+        (self._staging_root / "sandbox").mkdir(parents=True, exist_ok=True)
+
+        self._container_name = self.config.name or f"predict-rlm-{uuid.uuid4().hex}"
+        # Use the canonical (symlink-resolved) path on both sides of the bind
+        # mount so it matches the resolved paths in injected code; the container
+        # has no host-side symlinks (e.g. /private/var on macOS).
+        staging = str(self._staging_root.resolve())
+        runner_in_container = str(runner_path.resolve())
+        return [
+            "docker",
+            "run",
+            "-i",
+            "--rm",
+            "--name",
+            self._container_name,
+            "--network",
+            self.config.docker_network,
+            # 1) Stage the runner + injected (resolved) host paths at their own
+            #    absolute path so input-file variables resolve inside the container.
+            "-v",
+            f"{staging}:{staging}",
+            # 2) Mount the sandbox dir at a REAL ``/sandbox`` so the full stdlib
+            #    (os.*, shutil, zipfile, openpyxl, pandas) operates on
+            #    ``/sandbox/...`` natively — matching Pyodide's MEMFS. Without
+            #    this, only ``open``/``pathlib`` (which the runner patches) reach
+            #    the staging dir; ``os.path.exists``/``shutil.copy2``/etc. hit the
+            #    container's empty root and silently mislead agent code.
+            "-v",
+            f"{staging}/sandbox:/sandbox",
+            "-w",
+            "/sandbox",
+            "-e",
+            f"PREDICT_RLM_SBX_ROOT={staging}",
+            *self.config.docker_extra_args,
+            self.config.image,
+            self.config.python_executable,
+            "-u",
+            runner_in_container,
         ]
 
     def _prepare_runner_script(self) -> Path:

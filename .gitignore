@@ -20,3 +20,4 @@ examples/*/output/
 
 # Ad-hoc agent/session transcripts (large, one-off recovery artifacts)
 session-*.md
+data/

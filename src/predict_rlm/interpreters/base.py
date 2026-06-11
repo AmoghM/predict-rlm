@@ -7,7 +7,7 @@ import contextvars
 import threading
 from contextlib import asynccontextmanager, contextmanager
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, Field
 
@@ -110,7 +110,19 @@ class SandboxBackend(str, Enum):
 
 
 class SbxConfig(BaseModel):
-    """Configuration for the Docker Sandboxes backend."""
+    """Configuration for the native-CPython sandbox backends.
+
+    The ``runtime`` field selects how the JSON-RPC ``python_runner`` is
+    launched. All three runtimes share the same filesystem-staged file model
+    and stdio JSON-RPC protocol; they differ only in process isolation:
+
+    - ``"sbx"``  — Docker Sandboxes via the ``sbx`` CLI (the original backend).
+    - ``"docker"`` — a plain ``docker run -i`` container. Requires the ``docker``
+      CLI + daemon and a prebaked ``image`` carrying the runner's packages.
+    - ``"host"`` — a bare ``python3`` subprocess on the host (no isolation).
+      Useful for low-latency/debug runs where the host venv already has the
+      needed packages.
+    """
 
     name: str | None = None
     cpus: int | None = None
@@ -124,6 +136,15 @@ class SbxConfig(BaseModel):
     workspace_read_only: bool = False
     create_timeout: float = 120.0
     exec_timeout: float = 300.0
+
+    # Runtime selection and plain-Docker / host-subprocess options. Defaults
+    # preserve the original ``sbx`` CLI behavior.
+    runtime: Literal["sbx", "docker", "host"] = "sbx"
+    image: str | None = None
+    docker_network: str = "none"
+    docker_extra_args: list[str] = Field(default_factory=list)
+    python_executable: str = "python3"
+    staging_root_base: str | None = None
 
 
 class PredictRLMInterpreter(Protocol):
