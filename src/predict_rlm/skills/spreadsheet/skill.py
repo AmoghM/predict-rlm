@@ -25,6 +25,12 @@ spreadsheet_skill = Skill(
 - For sheets over ~1000 rows, read via `iter_rows(values_only=True)` with `read_only=True`; never iterate `ws.cell(r, c).value` in Python loops (prohibitively slow on WASM sandboxes, and still slow on native openpyxl for very large sheets).
 - When writing Python-computed values to cells, match the expected data type: if the task calls for a numeric rank, count, or integer index derived from parsing a label string (e.g. `"item_3"` → `3`), extract and write `int()` — not the raw label string. Example: `cell.value = int(label.rsplit("_", 1)[-1])`.
 
+## Reading efficiently (find a value without scanning everything)
+- Read metadata before data. Use any workbook map provided in the instruction (sheet names, dimensions, header rows) — or `ws.max_row`/`ws.max_column` plus the header row — to locate a target's region first, then read only that region.
+- Always BOUND your reads: pass `min_row`/`max_row` (and `min_col`/`max_col`) to `iter_rows`. Do not scan an entire sheet to find a value. Worksheets frequently report an inflated used-range (formatting applied to whole columns), so an unbounded `iter_rows(values_only=True)` can iterate ~1,000,000 phantom rows and stall the run.
+- Do not use `ws.cell(row, col)` random access on a `read_only=True` worksheet — it re-reads from the top and is slow. Read the bounded range with `iter_rows`, or open just that sheet without `read_only` if you genuinely need random access.
+- Locate each requested field once via the map/headers, read its bounded range, and move on. If a field is not present in the mapped structure, report it as not present — do not repeatedly re-scan or re-load the workbook hunting for it.
+
 ## Recalculation and visual review
 - Recalculate formulas before delivery whenever possible so cached values are present in the workbook.
 - `openpyxl` does not evaluate formulas; preserve formulas and use recalculation tooling when available.
