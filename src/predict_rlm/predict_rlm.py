@@ -70,6 +70,7 @@ from .trace import (
 )
 
 _CB_LOGGER = logging.getLogger("predict_rlm.callbacks")
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -1300,6 +1301,7 @@ class PredictRLM(dspy.RLM):
         """
         from .files import _is_list_annotation, is_file_type
 
+        self._phase_log("process_final_output:enter")
         raw = result.output
         if isinstance(raw, dict):
             for name in output_field_names:
@@ -1691,6 +1693,7 @@ class PredictRLM(dspy.RLM):
         sub_hist_start: int,
         run_start: float,
     ) -> RunTrace:
+        self._phase_log("build_run_trace:enter")
         trace_steps = steps
         pending_entry = getattr(self, "_partial_pending_entry", None)
         if status == "error" and pending_entry is not None:
@@ -1723,6 +1726,7 @@ class PredictRLM(dspy.RLM):
             else None
         )
 
+        self._phase_log("build_run_trace:done")
         return RunTrace(
             status=status,
             model=str(getattr(lm, "model", lm)),
@@ -1734,6 +1738,23 @@ class PredictRLM(dspy.RLM):
             telemetry_ref=self._telemetry_ref() if status == "error" else None,
             steps=trace_steps,
         )
+
+    def _phase_log(self, name: str) -> None:
+        """Log a phase marker so a stall AFTER the model's last action is locatable.
+
+        The dspy heartbeat callback only fires on LM/tool events, so the
+        post-SUBMIT phases (output extraction, sandbox file sync, trace build)
+        are a blind spot — a run that stalls there shows no further heartbeat and
+        is indistinguishable from a hung sandbox RPC. These markers fill that
+        gap: on a stall, the last ``rlm_phase:`` line in the container log says
+        exactly which phase wedged. Best-effort; never raises.
+        """
+        try:
+            t0 = getattr(self, "_run_start", None)
+            elapsed = f"{time.perf_counter() - t0:.2f}s" if t0 is not None else "?"
+            logger.warning("rlm_phase: %s (t=%s)", name, elapsed)
+        except Exception:
+            pass
 
     async def aforward(self, **kwargs: Any) -> dspy.Prediction:
         """Async version of forward(). Sets the LM context for async execution.
@@ -2064,6 +2085,7 @@ class PredictRLM(dspy.RLM):
         The RLM submits the sandbox path(s) it wrote to. We sync those files
         back to the host and replace the prediction value with File objects.
         """
+        self._phase_log("sync_output_files:enter")
         for field_name, kind in output_file_fields.items():
             info = file_plan["output_field_map"][field_name]
             host_dir = info["host_dir"]
@@ -2182,6 +2204,7 @@ class PredictRLM(dspy.RLM):
             )
 
         run_start = time.perf_counter()
+        self._run_start = run_start  # anchor for _phase_log elapsed timings
         lm = dspy.settings.lm
         sub_lm = self._sub_lm
         # Per-RLM instance ``lm`` has its own history (via ``lm.copy()``
@@ -2310,6 +2333,7 @@ class PredictRLM(dspy.RLM):
             )
 
         run_start = time.perf_counter()
+        self._run_start = run_start  # anchor for _phase_log elapsed timings
         lm = dspy.settings.lm
         sub_lm = self._sub_lm
         # Snapshot lm.history lengths at run start so ``usage_since`` can
