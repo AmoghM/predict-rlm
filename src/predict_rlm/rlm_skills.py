@@ -94,6 +94,16 @@ class Skill(BaseModel):
         default_factory=dict,
         description="Python modules to mount in sandbox: {import_name: host_path}",
     )
+    setup: str = Field(
+        default="",
+        description=(
+            "Python code run once in the sandbox at init (after modules are "
+            "mounted, before the first model block). Sandbox globals persist for "
+            "the session, so this can install transparent runtime helpers "
+            "(e.g. memoizing an expensive loader) without the model importing "
+            "anything."
+        ),
+    )
     tools: dict[str, Callable[..., Any]] = Field(
         default_factory=dict,
         description="Tool functions exposed to the RLM",
@@ -104,27 +114,33 @@ class Skill(BaseModel):
 
 def merge_skills(
     skills: list[Skill],
-) -> tuple[str, list[str], dict[str, str], dict[str, Callable]]:
-    """Merge multiple skills into combined instructions, packages, modules, and tools.
+) -> tuple[str, list[str], dict[str, str], dict[str, Callable], str]:
+    """Merge multiple skills into combined instructions, packages, modules, tools, setup.
 
     Args:
         skills: List of Skill instances to merge.
 
     Returns:
-        Tuple of (merged_instructions, merged_packages, merged_modules, merged_tools).
+        Tuple of (merged_instructions, merged_packages, merged_modules,
+        merged_tools, merged_setup).
         Instructions are joined with section headers per skill.
         Packages are deduplicated preserving order.
         Modules are merged; duplicate import names raise ValueError.
         Tools are merged; duplicate names raise ValueError.
+        Setup snippets are concatenated in skill order (run once at sandbox init).
     """
     instructions_parts: list[str] = []
     seen_packages: dict[str, None] = {}
     merged_modules: dict[str, str] = {}
     merged_tools: dict[str, Callable] = {}
+    setup_parts: list[str] = []
 
     for skill in skills:
         if skill.instructions.strip():
             instructions_parts.append(f"## Skill: {skill.name}\n\n{skill.instructions.strip()}")
+
+        if skill.setup.strip():
+            setup_parts.append(skill.setup.strip())
 
         for pkg in skill.packages:
             seen_packages.setdefault(pkg, None)
@@ -145,5 +161,12 @@ def merge_skills(
 
     merged_instructions = "\n\n".join(instructions_parts)
     merged_packages = list(seen_packages.keys())
+    merged_setup = "\n\n".join(setup_parts)
 
-    return merged_instructions, merged_packages, merged_modules, merged_tools
+    return (
+        merged_instructions,
+        merged_packages,
+        merged_modules,
+        merged_tools,
+        merged_setup,
+    )

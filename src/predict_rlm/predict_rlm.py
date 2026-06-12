@@ -864,17 +864,23 @@ class PredictRLM(dspy.RLM):
         self._current_telemetry_context: TelemetryContext | None = None
         self._current_predictor_id: str | None = None
 
-        # Merge skills into instructions, packages, modules, and tools
+        # Merge skills into instructions, packages, modules, tools, and setup
         self._skill_instructions = ""
         self._skill_packages: list[str] = []
         self._skill_modules: dict[str, str] = {}
+        self._skill_setup: str = ""
         if skills:
-            skill_instructions, skill_packages, skill_modules, skill_tools = merge_skills(
-                skills
-            )
+            (
+                skill_instructions,
+                skill_packages,
+                skill_modules,
+                skill_tools,
+                skill_setup,
+            ) = merge_skills(skills)
             self._skill_instructions = skill_instructions
             self._skill_packages = skill_packages
             self._skill_modules = skill_modules
+            self._skill_setup = skill_setup
         else:
             skill_tools = {}
 
@@ -2038,6 +2044,13 @@ class PredictRLM(dspy.RLM):
             for mod_name, host_path in self._skill_modules.items():
                 repl.mount_file_at(host_path, f"/sandbox/lib/{mod_name}.py")
             repl.execute("import sys; sys.path.insert(0, '/sandbox/lib')")
+
+        # Run skill setup code once, after modules are mounted and before the
+        # first model block. Sandbox globals persist for the session, so this can
+        # install transparent runtime helpers (e.g. a memoized loader) without the
+        # model importing anything.
+        if self._skill_setup.strip():
+            repl.execute(self._skill_setup)
 
     def _sync_output_files(
         self,

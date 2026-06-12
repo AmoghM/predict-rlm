@@ -120,4 +120,47 @@ If the 'Answer position' names a sheet that does not exist in the workbook, crea
 """,
     packages=["openpyxl", "pandas", "formulas"],
     modules={"formula_eval": str(_MODULES_DIR / "formula_eval.py")},
+    # Transparently memoize read-only ``openpyxl.load_workbook`` so a model that
+    # re-loads the same workbook many times across code blocks pays the parse
+    # cost once. Pure runtime optimization — no instruction/behavior change —
+    # installed at sandbox init so the model's existing
+    # ``from openpyxl import load_workbook`` picks up the cached function.
+    #
+    # ONLY read-only loads are cached: read-only openpyxl workbooks are immutable,
+    # so sharing one across calls is safe. Writable loads (the edit/save path) and
+    # any error pass straight through, untouched. The cache key includes the file
+    # mtime, so a workbook rewritten on disk (e.g. after ``recalculate``) is
+    # re-parsed rather than served stale.
+    setup="""
+import os as _os
+import openpyxl as _openpyxl
+
+if not getattr(_openpyxl, "_rlm_cache_installed", False):
+    _rlm_real_load_workbook = _openpyxl.load_workbook
+    _rlm_wb_cache = {}
+
+    def _rlm_cached_load_workbook(filename, **kwargs):
+        if not kwargs.get("read_only", False):
+            return _rlm_real_load_workbook(filename, **kwargs)
+        try:
+            key = (
+                str(filename),
+                _os.path.getmtime(filename),
+                bool(kwargs.get("data_only", False)),
+                bool(kwargs.get("keep_vba", False)),
+                bool(kwargs.get("keep_links", True)),
+                bool(kwargs.get("rich_text", False)),
+            )
+        except OSError:
+            return _rlm_real_load_workbook(filename, **kwargs)
+        wb = _rlm_wb_cache.get(key)
+        if wb is None:
+            wb = _rlm_real_load_workbook(filename, **kwargs)
+            _rlm_wb_cache[key] = wb
+        return wb
+
+    _openpyxl.load_workbook = _rlm_cached_load_workbook
+    _openpyxl._rlm_wb_cache = _rlm_wb_cache
+    _openpyxl._rlm_cache_installed = True
+""",
 )

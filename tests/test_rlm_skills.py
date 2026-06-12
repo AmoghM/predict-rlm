@@ -31,7 +31,7 @@ class TestSkill:
 
 class TestMergeSkills:
     def test_empty_list(self):
-        instructions, packages, modules, tools = merge_skills([])
+        instructions, packages, modules, tools, setup = merge_skills([])
         assert instructions == ""
         assert packages == []
         assert tools == {}
@@ -42,7 +42,7 @@ class TestMergeSkills:
             instructions="Use pdfplumber.",
             packages=["pdfplumber"],
         )
-        instructions, packages, modules, tools = merge_skills([skill])
+        instructions, packages, modules, tools, setup = merge_skills([skill])
         assert "Skill: pdf" in instructions
         assert "Use pdfplumber." in instructions
         assert packages == ["pdfplumber"]
@@ -51,7 +51,7 @@ class TestMergeSkills:
     def test_multiple_skills_merge_instructions(self):
         s1 = Skill(name="a", instructions="Do A.")
         s2 = Skill(name="b", instructions="Do B.")
-        instructions, _, _, _ = merge_skills([s1, s2])
+        instructions, _, _, _, _ = merge_skills([s1, s2])
         assert "Skill: a" in instructions
         assert "Skill: b" in instructions
         assert "Do A." in instructions
@@ -60,7 +60,7 @@ class TestMergeSkills:
     def test_package_dedup(self):
         s1 = Skill(name="a", packages=["pandas", "numpy"])
         s2 = Skill(name="b", packages=["numpy", "scipy"])
-        _, packages, _, _ = merge_skills([s1, s2])
+        _, packages, _, _, _ = merge_skills([s1, s2])
         assert packages == ["pandas", "numpy", "scipy"]
 
     def test_tool_merge(self):
@@ -72,8 +72,22 @@ class TestMergeSkills:
 
         s1 = Skill(name="a", tools={"tool_a": tool_a})
         s2 = Skill(name="b", tools={"tool_b": tool_b})
-        _, _, _, tools = merge_skills([s1, s2])
+        _, _, _, tools, _ = merge_skills([s1, s2])
         assert set(tools.keys()) == {"tool_a", "tool_b"}
+
+    def test_setup_merge_and_skip_empty(self):
+        s1 = Skill(name="a", setup="install_a()")
+        s2 = Skill(name="b", setup="")  # empty setup is skipped
+        s3 = Skill(name="c", setup="  install_c()  ")
+        _, _, _, _, setup = merge_skills([s1, s2, s3])
+        assert "install_a()" in setup
+        assert "install_c()" in setup
+        # Joined in skill order; empty one contributes nothing.
+        assert setup == "install_a()\n\ninstall_c()"
+
+    def test_setup_defaults_empty(self):
+        _, _, _, _, setup = merge_skills([Skill(name="a")])
+        assert setup == ""
 
     def test_tool_name_conflict_raises(self):
         def tool_x():
@@ -88,7 +102,7 @@ class TestMergeSkills:
         s1 = Skill(name="a", instructions="")
         s2 = Skill(name="b", instructions="  ")
         s3 = Skill(name="c", instructions="Real instructions.")
-        instructions, _, _, _ = merge_skills([s1, s2, s3])
+        instructions, _, _, _, _ = merge_skills([s1, s2, s3])
         assert "Skill: a" not in instructions
         assert "Skill: b" not in instructions
         assert "Skill: c" in instructions
@@ -96,7 +110,7 @@ class TestMergeSkills:
     def test_module_merge(self):
         s1 = Skill(name="a", modules={"formula_eval": "/path/to/formula_eval.py"})
         s2 = Skill(name="b", modules={"chart_helper": "/path/to/chart_helper.py"})
-        _, _, modules, _ = merge_skills([s1, s2])
+        _, _, modules, _, _ = merge_skills([s1, s2])
         assert modules == {
             "formula_eval": "/path/to/formula_eval.py",
             "chart_helper": "/path/to/chart_helper.py",
@@ -110,11 +124,11 @@ class TestMergeSkills:
 
     def test_single_skill_with_modules(self):
         s = Skill(name="spreadsheet", modules={"formula_eval": "/path/formula_eval.py"})
-        _, _, modules, _ = merge_skills([s])
+        _, _, modules, _, _ = merge_skills([s])
         assert modules == {"formula_eval": "/path/formula_eval.py"}
 
     def test_empty_modules_skipped(self):
         s1 = Skill(name="a", modules={})
         s2 = Skill(name="b", modules={"mod": "/path/mod.py"})
-        _, _, modules, _ = merge_skills([s1, s2])
+        _, _, modules, _, _ = merge_skills([s1, s2])
         assert modules == {"mod": "/path/mod.py"}
