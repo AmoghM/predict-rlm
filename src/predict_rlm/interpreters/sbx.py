@@ -205,12 +205,9 @@ class SbxInterpreter(PredictRLMInterpreter):
             return
         self._shutdown = True
         if self._proc and self._proc.poll() is None:
+            self._request_shutdown()
             try:
-                self._send_request("shutdown", {})
-            except Exception:
-                pass
-            try:
-                self._proc.wait(timeout=5)
+                self._proc.wait(timeout=self.config.shutdown_timeout)
             except subprocess.TimeoutExpired:
                 self._proc.kill()
                 self._proc.wait(timeout=5)
@@ -623,6 +620,23 @@ class SbxInterpreter(PredictRLMInterpreter):
         assert self._proc.stdin is not None
         self._proc.stdin.write(json.dumps(response) + "\n")
         self._proc.stdin.flush()
+
+    def _request_shutdown(self) -> None:
+        assert self._proc is not None
+        if self._proc.stdin is None:
+            return
+        self._request_id += 1
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "shutdown",
+            "params": {},
+            "id": self._request_id,
+        }
+        try:
+            self._proc.stdin.write(json.dumps(payload) + "\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError):
+            pass
 
     def _send_request(self, method: str, params: dict[str, Any] | None = None) -> dict:
         self._ensure_process_for_method(method)

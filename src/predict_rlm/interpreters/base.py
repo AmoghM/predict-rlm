@@ -136,6 +136,7 @@ class SbxConfig(BaseModel):
     workspace_read_only: bool = False
     create_timeout: float = 120.0
     exec_timeout: float = 300.0
+    shutdown_timeout: float = 2.0
 
     # Runtime selection and plain-Docker / host-subprocess options. Defaults
     # preserve the original ``sbx`` CLI behavior.

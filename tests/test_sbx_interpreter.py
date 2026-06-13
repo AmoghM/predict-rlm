@@ -291,6 +291,46 @@ class TestSbxInterpreterLocalRunner:
             staging_root / "sandbox" / "input" / "source" / "input.txt"
         ).read_text(encoding="utf-8") == "host visible"
 
+    def test_shutdown_does_not_wait_full_exec_timeout_for_unresponsive_runner(
+        self, tmp_path: Path
+    ):
+        runner_script = tmp_path / "hanging_shutdown_runner.py"
+        runner_script.write_text(
+            """
+import json
+import sys
+import time
+
+for line in sys.stdin:
+    request = json.loads(line)
+    request_id = request.get("id")
+    method = request.get("method")
+    if method == "execute":
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0",
+            "result": {"output": "ready\\n"},
+            "id": request_id,
+        }) + "\\n")
+        sys.stdout.flush()
+    elif method == "shutdown":
+        time.sleep(60)
+""".lstrip(),
+            encoding="utf-8",
+        )
+        interpreter = SbxInterpreter(
+            config=SbxConfig(name="local-test", exec_timeout=30),
+            preinstall_packages=False,
+            _runner_command=[sys.executable, "-u", str(runner_script)],
+            _staging_root=tmp_path / "staging",
+        )
+        assert interpreter.execute("print('ready')") == "ready\n"
+
+        started = time.perf_counter()
+        interpreter.shutdown()
+
+        assert time.perf_counter() - started < 3
+        assert interpreter._proc is None
+
     def test_persist_preserves_owned_staging_root(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ):
