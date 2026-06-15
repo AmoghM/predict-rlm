@@ -56,6 +56,7 @@ spreadsheet_skill = Skill(
 - When a formula should produce an integer result (period counts, lookup indices, whole-unit financial figures), wrap it with `=ROUND(expr,0)` or `=INT(expr)` to avoid floating-point drift against integer reference values. Example: `=ROUND(DB($C$4,$C$5,$C$6,C8,1),0)` instead of a bare `DB()` call when reference values are whole numbers.
 
 ## Citation requirements
+- When extracting or reporting values FROM a workbook in your answer, cite the source location of each value as `Sheet!Cell` (or `Sheet!Range`) so every extracted fact is traceable back to the cell it came from. Treat this as mandatory for data-extraction tasks: never state an extracted figure without its source sheet and cell/range.
 - Cite sources inside the spreadsheet using plain-text URLs.
 - For financial models, cite model inputs in cell comments.
 - For tabular data sourced externally, add a source column when each row represents a separate item.
