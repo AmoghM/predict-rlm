@@ -45,6 +45,18 @@ class TestRuntimeCommandBuilding:
         assert Path(cmd[2]).is_file()
         assert (itp._staging_root / "sandbox").is_dir()
 
+    def test_host_sandbox_root_must_be_literal_sandbox(self, tmp_path: Path):
+        with pytest.raises(SandboxFatalError, match="literal /sandbox"):
+            SbxInterpreter(
+                config=SbxConfig(
+                    runtime="host",
+                    python_executable="/usr/bin/python3",
+                    host_sandbox_root=str(tmp_path / "real-sandbox"),
+                ),
+                preinstall_packages=False,
+                _staging_root=tmp_path / "staging",
+            )
+
     def test_docker_command_argv(self, tmp_path: Path):
         itp = SbxInterpreter(
             config=SbxConfig(
@@ -136,6 +148,43 @@ class TestHostRuntimeSmoke:
             assert host_file.read_text() == "native-cpython"
         finally:
             itp.shutdown()
+
+    @pytest.mark.skipif(
+        os.environ.get("PREDICT_RLM_RUN_HOST_SANDBOX_TESTS") != "1"
+        or not os.access("/sandbox", os.W_OK),
+        reason="requires an opt-in writable /sandbox owned by this test run",
+    )
+    def test_external_sandbox_root_supports_literal_stdlib_paths(self, tmp_path: Path):
+        itp = SbxInterpreter(
+            config=SbxConfig(
+                runtime="host",
+                python_executable=sys.executable,
+                host_sandbox_root="/sandbox",
+            ),
+            preinstall_packages=False,
+            _staging_root=tmp_path / "staging",
+        )
+        out = tmp_path / "out.txt"
+        archive = tmp_path / "archive.zip"
+
+        try:
+            itp.mkdir_p("/sandbox/output")
+            itp.execute(
+                "import os, tempfile, zipfile\n"
+                "fd, tmp = tempfile.mkstemp()\n"
+                "os.write(fd, b'native-cpython')\n"
+                "os.close(fd)\n"
+                "os.replace(tmp, '/sandbox/output/out.txt')\n"
+                "with zipfile.ZipFile('/sandbox/output/archive.zip', 'w') as z:\n"
+                "    z.writestr('entry.txt', 'ok')"
+            )
+            itp.sync_file_to("/sandbox/output/out.txt", str(out))
+            itp.sync_file_to("/sandbox/output/archive.zip", str(archive))
+        finally:
+            itp.shutdown()
+
+        assert out.read_text(encoding="utf-8") == "native-cpython"
+        assert archive.is_file()
 
 
 @pytest.mark.skipif(

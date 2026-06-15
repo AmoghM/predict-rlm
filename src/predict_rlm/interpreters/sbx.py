@@ -80,6 +80,13 @@ class SbxInterpreter(PredictRLMInterpreter):
             self._host_workspace / ".predict_rlm_sbx" / uuid.uuid4().hex
         )
         self._staging_root.mkdir(parents=True, exist_ok=True)
+        self._host_sandbox_root = (
+            Path(self.config.host_sandbox_root).resolve()
+            if self.config.runtime == "host" and self.config.host_sandbox_root
+            else None
+        )
+        if self._host_sandbox_root is not None:
+            self._reset_sandbox_root()
         self._container_name: str | None = None
         self._proc: subprocess.Popen[str] | None = None
         self._stdout_lines: queue.Queue[str] = queue.Queue()
@@ -146,7 +153,7 @@ class SbxInterpreter(PredictRLMInterpreter):
     def _host_path_for_virtual_path(self, virtual_path: str) -> Path:
         if virtual_path != "/sandbox" and not virtual_path.startswith("/sandbox/"):
             raise ValueError(f"Sbx virtual path must be under /sandbox: {virtual_path}")
-        sandbox_root = (self._staging_root / "sandbox").resolve()
+        sandbox_root = self._sandbox_root()
         rel = virtual_path.removeprefix("/sandbox").lstrip("/")
         host_path = (sandbox_root / rel).resolve()
         try:
@@ -167,9 +174,63 @@ class SbxInterpreter(PredictRLMInterpreter):
         return value
 
     def _virtual_path_for_host_path(self, host_path: Path) -> str:
-        sandbox_root = (self._staging_root / "sandbox").resolve()
+        sandbox_root = self._sandbox_root()
         rel = host_path.resolve().relative_to(sandbox_root)
         return "/sandbox/" + rel.as_posix()
+
+    def _sandbox_root(self) -> Path:
+        if self._host_sandbox_root is not None:
+            return self._host_sandbox_root
+        return (self._staging_root / "sandbox").resolve()
+
+    def _validate_external_sandbox_root(self, sandbox_root: Path) -> None:
+        resolved = sandbox_root.resolve()
+        if resolved.parent == resolved:
+            raise SandboxFatalError("host_sandbox_root cannot be the filesystem root")
+        literal_sandbox = Path("/sandbox").resolve()
+        if resolved != literal_sandbox:
+            raise SandboxFatalError(
+                "host_sandbox_root must resolve to literal /sandbox. "
+                "Other paths do not catch unpatched stdlib writes to "
+                "/sandbox/... and would silently re-open the host-runtime "
+                "output sync bug."
+            )
+
+    def _reset_sandbox_root(self) -> None:
+        sandbox_root = self._sandbox_root()
+        if self._host_sandbox_root is None:
+            shutil.rmtree(sandbox_root, ignore_errors=True)
+            sandbox_root.mkdir(parents=True, exist_ok=True)
+            return
+
+        self._validate_external_sandbox_root(sandbox_root)
+        sandbox_root.mkdir(parents=True, exist_ok=True)
+        # This wipes a process-wide real /sandbox. Only use this mode when the
+        # hosting service guarantees one request/job per process or container
+        # (for example Cloud Run concurrency=1); otherwise concurrent jobs will
+        # corrupt each other's in-flight outputs.
+        for child in sandbox_root.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+
+    def _link_external_host_sandbox_root(self) -> None:
+        if self._host_sandbox_root is None:
+            (self._staging_root / "sandbox").mkdir(parents=True, exist_ok=True)
+            return
+
+        sandbox_root = self._sandbox_root()
+        self._validate_external_sandbox_root(sandbox_root)
+        sandbox_root.mkdir(parents=True, exist_ok=True)
+        staging_sandbox = self._staging_root / "sandbox"
+        if staging_sandbox.is_symlink():
+            if staging_sandbox.resolve() == sandbox_root:
+                return
+            staging_sandbox.unlink()
+        elif staging_sandbox.exists():
+            shutil.rmtree(staging_sandbox)
+        staging_sandbox.symlink_to(sandbox_root, target_is_directory=True)
 
     def configure_runtime(
         self,
@@ -196,9 +257,8 @@ class SbxInterpreter(PredictRLMInterpreter):
 
     def reset(self) -> None:
         self._send_request("reset", {})
-        sandbox_root = self._staging_root / "sandbox"
-        shutil.rmtree(sandbox_root, ignore_errors=True)
-        sandbox_root.mkdir(parents=True, exist_ok=True)
+        self._reset_sandbox_root()
+        self._link_external_host_sandbox_root()
 
     def shutdown(self) -> None:
         if self._shutdown:
@@ -233,6 +293,8 @@ class SbxInterpreter(PredictRLMInterpreter):
                     text=True,
                 )
         self._tool_executor.shutdown(wait=False, cancel_futures=True)
+        if self._host_sandbox_root is not None and not self.config.persist:
+            self._reset_sandbox_root()
         self._cleanup_staging_root()
 
     def _cleanup_staging_root(self) -> None:
@@ -361,15 +423,16 @@ class SbxInterpreter(PredictRLMInterpreter):
         ``_ensure_process`` makes the runner resolve the same staging root, and
         host-side mount/sync already share that filesystem directly.
 
-        Caveat vs the docker runtime: there is no real ``/sandbox`` mount on the
-        host, so only the runner-patched ``open``/``pathlib`` reach the staging
-        dir for literal ``/sandbox/...`` paths; ``os.*``/``shutil``/``zipfile``
-        on those literal paths do not. Code should use the injected (already
-        resolved) file-path variables, which the docker runtime makes
-        unnecessary by mounting the sandbox at a real ``/sandbox``.
+        By default, literal ``/sandbox/...`` paths still depend on the
+        runner-patched ``open``/``pathlib`` shims. When ``host_sandbox_root`` is
+        set, this runtime treats that directory as the real sandbox root and
+        symlinks the runner staging dir's ``sandbox`` child to it. That makes
+        unpatched stdlib calls such as ``os.replace`` and ``zipfile`` on literal
+        ``/sandbox/...`` paths land where host sync expects, as long as the host
+        process really has the same directory mounted at ``/sandbox``.
         """
         runner_path = self._prepare_runner_script()
-        (self._staging_root / "sandbox").mkdir(parents=True, exist_ok=True)
+        self._link_external_host_sandbox_root()
         return [self.config.python_executable, "-u", str(runner_path)]
 
     def _build_docker_runner_command(self) -> list[str]:

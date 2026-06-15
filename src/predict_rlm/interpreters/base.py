@@ -146,6 +146,14 @@ class SbxConfig(BaseModel):
     docker_extra_args: list[str] = Field(default_factory=list)
     python_executable: str = "python3"
     staging_root_base: str | None = None
+    host_sandbox_root: str | None = Field(
+        default=None,
+        description=(
+            "Host-runtime only. Must resolve to the literal /sandbox directory. "
+            "This lets unpatched stdlib calls to literal /sandbox/... paths and "
+            "predict-RLM's staged file sync converge on the same real directory."
+        ),
+    )
 
 
 class PredictRLMInterpreter(Protocol):
