@@ -915,6 +915,220 @@ class TestTracedErrorHandling:
         assert exc.trace.steps == []
 
 
+class TestExtractFallbackMetering:
+    """Metering + bounding of the max-iterations extract fallback (ticket 2.6).
+
+    The fallback makes ONE MAIN-LM dspy.Predict call that ``max_llm_calls``
+    (a dspy-internal, sandbox-tools-only counter) never sees. PredictRLM meters
+    it on an instance counter, surfaces it on the run trace, and bounds it with
+    ``max_extract_fallbacks``.
+    """
+
+    @staticmethod
+    def _looping_context():
+        repl = MagicMock()
+        context = MagicMock()
+        context.__enter__.return_value = repl
+        context.__exit__.return_value = False
+        return context
+
+    def _drive_to_fallback(self, rlm, **input_args):
+        """Run _forward_traced with iterations that never SUBMIT."""
+        context = self._looping_context()
+        history = REPLHistory(
+            entries=[REPLEntry(reasoning="r", code="c", output="o")]
+        )
+        with (
+            patch.object(PredictRLM, "_interpreter_context", return_value=context),
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
+            patch.object(PredictRLM, "_build_variables", return_value=[]),
+            patch.object(rlm, "_execute_iteration", return_value=history),
+        ):
+            return rlm._forward_traced(None, **input_args)
+
+    def test_fallback_is_metered_and_surfaced_on_trace(self):
+        sink = ListTelemetrySink()
+        tc = TelemetryContext(sink=sink, trace_id="trace_fallback_ok")
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            telemetry_context=tc,
+        )
+        fake_pred = dspy.Prediction(
+            answer="x", trajectory=[], final_reasoning="Extract forced final output"
+        )
+        with patch.object(rlm, "_extract_fallback", return_value=fake_pred) as mock_fb:
+            pred = self._drive_to_fallback(rlm, images=["img"], query="q")
+
+        mock_fb.assert_called_once()
+        assert rlm._extract_fallback_count == 1
+        assert pred.trace.status == "max_iterations"
+        assert pred.trace.extract_fallbacks == 1
+        assert pred.trace.extract_fallbacks_total == 1
+        assert "rlm.extract_fallback.ok" in [r["name"] for r in sink.records]
+
+    def test_fallback_skipped_when_bound_exhausted(self):
+        rlm = PredictRLM(
+            DefaultAnswerSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            max_extract_fallbacks=0,
+        )
+        with patch.object(rlm, "_extract_fallback") as mock_fb:
+            pred = self._drive_to_fallback(rlm, instruction="do it")
+
+        mock_fb.assert_not_called()
+        assert rlm._extract_fallback_count == 0
+        assert pred.trace.status == "max_iterations"
+        assert pred.trace.extract_fallbacks == 0
+        assert pred.trace.extract_fallbacks_total == 0
+        # Degraded "no submit" outcome: field falls back to its registered
+        # default (None), no new exception type.
+        assert pred.answer is None
+        assert "skipped" in pred.final_reasoning.lower()
+
+    def test_submit_run_records_zero_fallbacks(self):
+        rlm = PredictRLM(
+            ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=3
+        )
+        context = self._looping_context()
+        final = dspy.Prediction(answer="done", trajectory=[], final_reasoning="ok")
+        with (
+            patch.object(PredictRLM, "_interpreter_context", return_value=context),
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
+            patch.object(PredictRLM, "_build_variables", return_value=[]),
+            patch.object(rlm, "_execute_iteration", return_value=final),
+            patch.object(rlm, "_extract_fallback") as mock_fb,
+        ):
+            pred = rlm._forward_traced(None, images=["img"], query="q")
+
+        mock_fb.assert_not_called()
+        assert rlm._extract_fallback_count == 0
+        assert pred.trace.status == "completed"
+        assert pred.trace.extract_fallbacks == 0
+
+    def test_reused_instance_meters_each_forward(self):
+        # Budget is PER-FORWARD (reset each run), so a reused instance gets the
+        # fallback on every max-iterations run — default 1 == today's behavior
+        # plus metering. The lifetime total keeps the accumulation visible.
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            max_extract_fallbacks=1,
+        )
+        def fresh_pred(*_args, **_kwargs):
+            # Distinct object per call so the two runs' traces don't alias.
+            return dspy.Prediction(
+                answer="x",
+                trajectory=[],
+                final_reasoning="Extract forced final output",
+            )
+
+        with patch.object(rlm, "_extract_fallback", side_effect=fresh_pred) as mock_fb:
+            first = self._drive_to_fallback(rlm, images=["img"], query="q")
+            second = self._drive_to_fallback(rlm, images=["img"], query="q")
+
+        # Both forwards spend their own per-forward budget.
+        assert mock_fb.call_count == 2
+        assert first.trace.extract_fallbacks == 1
+        assert second.trace.extract_fallbacks == 1
+        assert first.trace.extract_fallbacks_total == 1
+        assert second.trace.extract_fallbacks_total == 2
+        assert rlm._extract_fallback_count == 2
+        assert second.trace.status == "max_iterations"
+
+    @pytest.mark.asyncio
+    async def test_async_fallback_is_metered(self):
+        rlm = PredictRLM(
+            ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=1
+        )
+        context = self._looping_context()
+        history = REPLHistory(
+            entries=[REPLEntry(reasoning="r", code="c", output="o")]
+        )
+        fake_pred = dspy.Prediction(
+            answer="x", trajectory=[], final_reasoning="Extract forced final output"
+        )
+        with (
+            patch.object(PredictRLM, "_interpreter_context", return_value=context),
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
+            patch.object(PredictRLM, "_build_variables", return_value=[]),
+            patch.object(
+                rlm, "_aexecute_iteration", new=AsyncMock(return_value=history)
+            ),
+            patch.object(
+                rlm, "_aextract_fallback", new=AsyncMock(return_value=fake_pred)
+            ) as mock_fb,
+        ):
+            pred = await rlm._aforward_traced(None, images=["img"], query="q")
+
+        mock_fb.assert_awaited_once()
+        assert rlm._extract_fallback_count == 1
+        assert pred.trace.extract_fallbacks == 1
+
+    def test_forward_accepts_per_call_bound_override(self):
+        rlm = PredictRLM(
+            ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=1
+        )
+        kwargs = {"images": ["img"], "query": "q", "max_extract_fallbacks": 5}
+        bound = rlm._pop_extract_fallback_bound(kwargs)
+        # Override is popped (never leaks into signature inputs) and returned,
+        # not stored on the instance — per-forward state is local.
+        assert "max_extract_fallbacks" not in kwargs
+        assert bound == 5
+        assert not hasattr(rlm, "_current_max_extract_fallbacks")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_aforwards_do_not_race_on_metering(self):
+        # Two concurrent forwards on ONE instance, both hitting max_iterations,
+        # must EACH get their own fallback with a per-run count of 1. Shared
+        # instance-attribute counters would let one run's increment make the
+        # other skip its fallback (or read the wrong trace value).
+        rlm = PredictRLM(
+            ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=1
+        )
+        context = self._looping_context()
+
+        async def slow_iter(*_args, **_kwargs):
+            await asyncio.sleep(0)  # force interleaving between the two runs
+            return REPLHistory(
+                entries=[REPLEntry(reasoning="r", code="c", output="o")]
+            )
+
+        async def slow_fallback(*_args, **_kwargs):
+            await asyncio.sleep(0)  # yield inside the critical section
+            return dspy.Prediction(
+                answer="x",
+                trajectory=[],
+                final_reasoning="Extract forced final output",
+            )
+
+        with (
+            patch.object(PredictRLM, "_interpreter_context", return_value=context),
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
+            patch.object(PredictRLM, "_build_variables", return_value=[]),
+            patch.object(
+                rlm, "_aexecute_iteration", new=AsyncMock(side_effect=slow_iter)
+            ),
+            patch.object(
+                rlm, "_aextract_fallback", new=AsyncMock(side_effect=slow_fallback)
+            ) as mock_fb,
+        ):
+            first, second = await asyncio.gather(
+                rlm._aforward_traced(None, images=["img"], query="q"),
+                rlm._aforward_traced(None, images=["img"], query="q"),
+            )
+
+        assert mock_fb.await_count == 2
+        assert first.trace.extract_fallbacks == 1
+        assert second.trace.extract_fallbacks == 1
+        assert first.trace.status == "max_iterations"
+        assert second.trace.status == "max_iterations"
+        assert rlm._extract_fallback_count == 2  # lifetime total across both
+
+
 class TestModelsFromSchema:
     """Tests for _models_from_schema function that reconstructs Pydantic models."""
 
