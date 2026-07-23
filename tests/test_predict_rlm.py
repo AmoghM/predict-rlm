@@ -965,6 +965,7 @@ class TestExtractFallbackMetering:
         assert rlm._extract_fallback_count == 1
         assert pred.trace.status == "max_iterations"
         assert pred.trace.extract_fallbacks == 1
+        assert pred.trace.extract_fallbacks_total == 1
         assert "rlm.extract_fallback.ok" in [r["name"] for r in sink.records]
 
     def test_fallback_skipped_when_bound_exhausted(self):
@@ -981,6 +982,7 @@ class TestExtractFallbackMetering:
         assert rlm._extract_fallback_count == 0
         assert pred.trace.status == "max_iterations"
         assert pred.trace.extract_fallbacks == 0
+        assert pred.trace.extract_fallbacks_total == 0
         # Degraded "no submit" outcome: field falls back to its registered
         # default (None), no new exception type.
         assert pred.answer is None
@@ -1006,25 +1008,35 @@ class TestExtractFallbackMetering:
         assert pred.trace.status == "completed"
         assert pred.trace.extract_fallbacks == 0
 
-    def test_reused_instance_stops_at_lifetime_bound(self):
+    def test_reused_instance_meters_each_forward(self):
+        # Budget is PER-FORWARD (reset each run), so a reused instance gets the
+        # fallback on every max-iterations run — default 1 == today's behavior
+        # plus metering. The lifetime total keeps the accumulation visible.
         rlm = PredictRLM(
             ImageAnalysisSignature,
             sub_lm=MagicMock(),
             max_iterations=1,
             max_extract_fallbacks=1,
         )
-        fake_pred = dspy.Prediction(
-            answer="x", trajectory=[], final_reasoning="Extract forced final output"
-        )
-        with patch.object(rlm, "_extract_fallback", return_value=fake_pred) as mock_fb:
+        def fresh_pred(*_args, **_kwargs):
+            # Distinct object per call so the two runs' traces don't alias.
+            return dspy.Prediction(
+                answer="x",
+                trajectory=[],
+                final_reasoning="Extract forced final output",
+            )
+
+        with patch.object(rlm, "_extract_fallback", side_effect=fresh_pred) as mock_fb:
             first = self._drive_to_fallback(rlm, images=["img"], query="q")
             second = self._drive_to_fallback(rlm, images=["img"], query="q")
 
-        # Only the first forward may spend the single-call budget.
-        assert mock_fb.call_count == 1
-        assert rlm._extract_fallback_count == 1
+        # Both forwards spend their own per-forward budget.
+        assert mock_fb.call_count == 2
         assert first.trace.extract_fallbacks == 1
-        assert second.trace.extract_fallbacks == 0
+        assert second.trace.extract_fallbacks == 1
+        assert first.trace.extract_fallbacks_total == 1
+        assert second.trace.extract_fallbacks_total == 2
+        assert rlm._extract_fallback_count == 2
         assert second.trace.status == "max_iterations"
 
     @pytest.mark.asyncio

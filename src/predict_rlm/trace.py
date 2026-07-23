@@ -279,7 +279,16 @@ class RunTrace(BaseModel):
             "this run (0 or 1). This call runs on the MAIN LM and is NOT "
             "counted by max_llm_calls (a dspy-internal, sandbox-tools-only "
             "counter). 0 when SUBMIT completed or the fallback was skipped "
-            "because max_extract_fallbacks was exhausted."
+            "because the per-forward max_extract_fallbacks was exhausted."
+        ),
+    )
+    extract_fallbacks_total: int = Field(
+        default=0,
+        description=(
+            "Cumulative extract-fallback LM calls made across every forward() "
+            "on this PredictRLM instance (lifetime total, not reset per run). "
+            "Useful for spotting accumulated unmetered main-LM cost when an "
+            "instance is reused for many rollouts (e.g. GEPA)."
         ),
     )
     duration_ms: int = Field(description="Total wall-clock duration in milliseconds")
