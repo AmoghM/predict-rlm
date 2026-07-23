@@ -163,6 +163,33 @@ class TestBuildDenoCommand:
         assert "--no-prompt" in cmd
 
     @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
+    def test_scoped_allow_env_sanitizes_names(self, _):
+        interp = _make_interpreter()
+        with patch.object(interp, "_get_deno_dir", return_value=[]):
+            cmd = interp._build_deno_command(
+                [], [], [], ["", "  ", "OK_VAR", "BAD,NAME"]
+            )
+        scoped = [a for a in cmd if a.startswith("--allow-env=")]
+        assert len(scoped) == 1
+        raw = scoped[0][len("--allow-env="):]
+        allowlist = raw.split(",")
+        # Valid caller var survives.
+        assert "OK_VAR" in allowlist
+        # No blank/empty grants (which crash Deno with invalid key "").
+        assert "" not in allowlist
+        assert ",," not in raw
+        assert not raw.endswith(",")
+        assert not raw.startswith(",")
+        # A name containing a comma must not silently widen into two grants.
+        assert "BAD" not in allowlist
+        assert "NAME" not in allowlist
+        assert "BAD,NAME" not in allowlist
+        # Base startup vars remain.
+        assert "HOME" in allowlist
+        # Still deduped.
+        assert len(allowlist) == len(set(allowlist))
+
+    @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
     def test_env_vars_as_final_arg(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):

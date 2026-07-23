@@ -51,6 +51,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Conservative POSIX-style env var name: a letter/underscore followed by
+# letters, digits, or underscores. Excludes commas, spaces, and '=' so a
+# malformed name can neither crash Deno (empty key) nor silently widen the
+# --allow-env grant by splitting into multiple names.
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
 
 class SandboxFatalError(RuntimeError):
     """Raised when the sandbox subprocess dies and the run cannot continue.
@@ -535,7 +541,16 @@ class JspiInterpreter(PythonInterpreter):
             "SKILL_PACKAGES",
         ]
         allowed_env: list[str] = []
-        for name in [*base_env_allowlist, *env_vars]:
+        for candidate in [*base_env_allowlist, *env_vars]:
+            name = str(candidate).strip()
+            if not name:
+                continue
+            if not _ENV_VAR_NAME_RE.match(name):
+                logger.warning(
+                    "Skipping invalid env var name in --allow-env grant: %r",
+                    candidate,
+                )
+                continue
             if name not in allowed_env:
                 allowed_env.append(name)
         args.append("--allow-env=" + ",".join(allowed_env))
@@ -548,8 +563,16 @@ class JspiInterpreter(PythonInterpreter):
         args.append("--no-prompt")
         args.append(str(RUNNER_PATH))
 
-        if env_vars:
-            args.append(",".join(env_vars))
+        # Pass the same sanitized names to the runner so it never requests a
+        # var Deno wasn't granted (an ungranted Deno.env.get throws and aborts
+        # the runner's env-loading loop) and a comma-bearing name can't split.
+        runner_env_vars = [
+            n
+            for n in (str(v).strip() for v in env_vars)
+            if n and _ENV_VAR_NAME_RE.match(n)
+        ]
+        if runner_env_vars:
+            args.append(",".join(runner_env_vars))
 
         return args
 
