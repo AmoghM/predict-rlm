@@ -272,6 +272,16 @@ class RunTrace(BaseModel):
     )
     iterations: int = Field(description="Total iterations executed")
     max_iterations: int = Field(description="Maximum iterations allowed")
+    extract_fallbacks: int = Field(
+        default=0,
+        description=(
+            "Number of max-iterations extract-fallback LM calls made during "
+            "this run (0 or 1). This call runs on the MAIN LM and is NOT "
+            "counted by max_llm_calls (a dspy-internal, sandbox-tools-only "
+            "counter). 0 when SUBMIT completed or the fallback was skipped "
+            "because max_extract_fallbacks was exhausted."
+        ),
+    )
     duration_ms: int = Field(description="Total wall-clock duration in milliseconds")
     usage: LMUsage = Field(
         default_factory=LMUsage, description="Token usage split by main and sub LM"

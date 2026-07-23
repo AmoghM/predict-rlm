@@ -750,6 +750,7 @@ class PredictRLM(dspy.RLM):
         sub_lm: dspy.LM | str | None = None,
         max_iterations: int = 30,
         max_llm_calls: int = 50,
+        max_extract_fallbacks: int = 1,
         max_output_chars: int = 100_000,
         verbose: bool = False,
         tools: dict[str, Callable[..., str]] | list[Callable] | None = None,
@@ -774,7 +775,27 @@ class PredictRLM(dspy.RLM):
                    string like "anthropic/claude-haiku-4-5". If None, uses the
                    current context LM (from dspy.settings.lm or dspy.context).
             max_iterations: Maximum REPL interaction iterations.
-            max_llm_calls: Maximum LM calls per execution.
+            max_llm_calls: Maximum LM calls per execution. NOTE: this is a
+                          dspy-internal counter that covers ONLY sandbox
+                          ``llm_query`` tools; it does not count the
+                          max-iterations extract fallback (see
+                          ``max_extract_fallbacks``).
+            max_extract_fallbacks: Lifetime budget (per instance) for the
+                          max-iterations extract fallback. When a forward()
+                          exhausts ``max_iterations`` without SUBMIT, the RLM
+                          makes ONE dspy.Predict call on the MAIN LM to force a
+                          final output. That call is invisible to
+                          ``max_llm_calls`` (a dspy-internal, sandbox-tools-only
+                          counter that this subclass cannot reach), so it is
+                          metered here instead. Defaults to 1 — the natural
+                          per-forward count — so reused instances (rollouts /
+                          GEPA) cannot silently accumulate unmetered main-LM
+                          calls. Once exhausted, the fallback LM call is skipped
+                          and the run returns the degraded "no submit" outcome
+                          (output fields fall back to their registered
+                          defaults). Can be overridden per call via a
+                          ``max_extract_fallbacks`` keyword to ``forward()`` /
+                          ``aforward()``.
             max_output_chars: Maximum characters to include from REPL output.
             verbose: Whether to log detailed execution info.
             tools: Additional tool functions callable from interpreter code.
@@ -918,6 +939,20 @@ class PredictRLM(dspy.RLM):
             sub_lm=None,  # Disable default llm_query tools
             interpreter=interpreter,
         )
+
+        # Metering + bound for the max-iterations extract fallback. This is a
+        # MAIN-LM dspy.Predict call that ``max_llm_calls`` never sees (that
+        # counter lives in dspy's closure over the sandbox llm_query tools).
+        #   _extract_fallback_count: lifetime tally across every forward() on
+        #       this instance — the budget checked against max_extract_fallbacks.
+        #   _current_max_extract_fallbacks: effective bound for the in-flight
+        #       forward(), overridable per call.
+        #   _run_extract_fallbacks: count for the current forward() (0 or 1),
+        #       surfaced on the run trace.
+        self.max_extract_fallbacks = max_extract_fallbacks
+        self._extract_fallback_count = 0
+        self._current_max_extract_fallbacks = max_extract_fallbacks
+        self._run_extract_fallbacks = 0
 
     def _create_predict_tool(self) -> Callable[..., dict[str, Any]]:
         """Create the predict tool for running DSPy signatures."""
@@ -1678,10 +1713,25 @@ class PredictRLM(dspy.RLM):
 
         Handles File inputs by mounting them into the sandbox,
         and File outputs by syncing them back to the host.
+
+        Accepts an optional ``max_extract_fallbacks`` keyword that overrides
+        the instance-level bound for this call only.
         """
+        self._set_call_extract_fallback_bound(kwargs)
         with self._lm_context():
             file_plan, kwargs = self._prepare_file_io(kwargs)
             return self._forward_traced(file_plan, **kwargs)
+
+    def _set_call_extract_fallback_bound(self, kwargs: dict[str, Any]) -> None:
+        """Apply a per-call ``max_extract_fallbacks`` override, if provided.
+
+        Popped from ``kwargs`` so it never leaks into signature-input
+        validation. Absent an override, the instance-level bound applies.
+        """
+        override = kwargs.pop("max_extract_fallbacks", None)
+        self._current_max_extract_fallbacks = (
+            self.max_extract_fallbacks if override is None else override
+        )
 
     def _build_run_trace(
         self,
@@ -1733,6 +1783,7 @@ class PredictRLM(dspy.RLM):
             sub_model=str(getattr(sub_lm, "model", sub_lm)) if sub_lm is not lm else None,
             iterations=len(trace_steps),
             max_iterations=self.max_iterations,
+            extract_fallbacks=getattr(self, "_run_extract_fallbacks", 0),
             duration_ms=ms_since(run_start),
             usage=LMUsage(main=main_usage, **({"sub": sub_usage} if sub_usage else {})),
             telemetry_ref=self._telemetry_ref() if status == "error" else None,
@@ -1761,7 +1812,11 @@ class PredictRLM(dspy.RLM):
 
         Uses aexecute() on the interpreter so asyncio.gather can run
         multiple rollouts concurrently.
+
+        Accepts an optional ``max_extract_fallbacks`` keyword that overrides
+        the instance-level bound for this call only.
         """
+        self._set_call_extract_fallback_bound(kwargs)
         self._context_lm = dspy.settings.lm
 
         try:
@@ -2191,6 +2246,105 @@ class PredictRLM(dspy.RLM):
             isinstance(result, dspy.Prediction),
         )
 
+    def _run_extract_fallback(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        """Meter + bound the sync max-iterations extract fallback.
+
+        ``_extract_fallback`` (inherited from dspy) makes ONE dspy.Predict call
+        on the MAIN LM that ``max_llm_calls`` cannot see. Track it on an
+        instance-scoped counter and gate it behind ``max_extract_fallbacks`` so
+        reused instances can't accumulate unmetered main-LM calls. When the
+        bound is exhausted, skip the LM call and return the degraded outcome.
+        """
+        bound = getattr(
+            self, "_current_max_extract_fallbacks", self.max_extract_fallbacks
+        )
+        start_ns = time.time_ns()
+        if self._extract_fallback_count >= bound:
+            self._write_telemetry_span(
+                "rlm.extract_fallback.skipped",
+                attributes=self._extract_fallback_attrs(bound),
+                start_time_unix_nano=start_ns,
+            )
+            return self._extract_fallback_skipped(
+                variables, history, output_field_names
+            )
+        self._extract_fallback_count += 1
+        self._run_extract_fallbacks += 1
+        self._write_telemetry_span(
+            "rlm.extract_fallback.ok",
+            attributes=self._extract_fallback_attrs(bound),
+            start_time_unix_nano=start_ns,
+        )
+        return self._extract_fallback(variables, history, output_field_names)
+
+    async def _arun_extract_fallback(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        """Async twin of :meth:`_run_extract_fallback`."""
+        bound = getattr(
+            self, "_current_max_extract_fallbacks", self.max_extract_fallbacks
+        )
+        start_ns = time.time_ns()
+        if self._extract_fallback_count >= bound:
+            self._write_telemetry_span(
+                "rlm.extract_fallback.skipped",
+                attributes=self._extract_fallback_attrs(bound),
+                start_time_unix_nano=start_ns,
+            )
+            return self._extract_fallback_skipped(
+                variables, history, output_field_names
+            )
+        self._extract_fallback_count += 1
+        self._run_extract_fallbacks += 1
+        self._write_telemetry_span(
+            "rlm.extract_fallback.ok",
+            attributes=self._extract_fallback_attrs(bound),
+            start_time_unix_nano=start_ns,
+        )
+        return await self._aextract_fallback(variables, history, output_field_names)
+
+    def _extract_fallback_attrs(self, bound: int) -> dict[str, Any]:
+        return {
+            "extract_fallback_count": self._extract_fallback_count,
+            "max_extract_fallbacks": bound,
+        }
+
+    def _extract_fallback_skipped(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        """Degraded "no submit" outcome when the fallback bound is exhausted.
+
+        Mirrors ``_extract_fallback``'s Prediction shape but makes NO LM call:
+        each output field falls back to its registered default (``""`` when the
+        field has no default), which is the same degradation the loop yields
+        when a run reaches max iterations without a real submission. This
+        reuses the existing "no submit" surface — it does not introduce a new
+        exception type or failure mode.
+        """
+        outputs: dict[str, Any] = {}
+        for name in output_field_names:
+            field = self.signature.output_fields.get(name)
+            default = (
+                _get_field_default(field) if field is not None else _NO_FIELD_DEFAULT
+            )
+            outputs[name] = "" if default is _NO_FIELD_DEFAULT else default
+        return dspy.Prediction(
+            trajectory=[e.model_dump() for e in history],
+            final_reasoning="Extract fallback skipped (max_extract_fallbacks exhausted)",
+            **outputs,
+        )
+
     def _forward_traced(
         self, file_plan: dict[str, Any] | None, **input_args: Any
     ) -> dspy.Prediction:
@@ -2205,6 +2359,7 @@ class PredictRLM(dspy.RLM):
 
         run_start = time.perf_counter()
         self._run_start = run_start  # anchor for _phase_log elapsed timings
+        self._run_extract_fallbacks = 0  # per-forward count surfaced on the trace
         lm = dspy.settings.lm
         sub_lm = self._sub_lm
         # Per-RLM instance ``lm`` has its own history (via ``lm.copy()``
@@ -2280,7 +2435,7 @@ class PredictRLM(dspy.RLM):
                             break
                         history = result
                     else:
-                        prediction = self._extract_fallback(
+                        prediction = self._run_extract_fallback(
                             variables, history, output_field_names
                         )
                         if output_file_fields:
@@ -2334,6 +2489,7 @@ class PredictRLM(dspy.RLM):
 
         run_start = time.perf_counter()
         self._run_start = run_start  # anchor for _phase_log elapsed timings
+        self._run_extract_fallbacks = 0  # per-forward count surfaced on the trace
         lm = dspy.settings.lm
         sub_lm = self._sub_lm
         # Snapshot lm.history lengths at run start so ``usage_since`` can
@@ -2411,7 +2567,7 @@ class PredictRLM(dspy.RLM):
                             break
                         history = result
                     else:
-                        prediction = await self._aextract_fallback(
+                        prediction = await self._arun_extract_fallback(
                             variables, history, output_field_names
                         )
                         if output_file_fields:
