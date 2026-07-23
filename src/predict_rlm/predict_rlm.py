@@ -80,6 +80,21 @@ class _IterationCallbackState:
     exception: Exception | None = None
 
 
+@dataclass
+class _ExtractFallbackState:
+    """Per-forward extract-fallback metering state.
+
+    Created fresh at the start of each forward()/aforward() and threaded to the
+    call site and the trace builder, so concurrent forwards on ONE instance
+    (e.g. asyncio.gather over rollouts) never race on a shared instance counter
+    or budget. ``bound`` is this run's per-forward budget; ``count`` is how many
+    fallback LM calls this run has made (0 or 1).
+    """
+
+    bound: int
+    count: int = 0
+
+
 # Capture the real dspy.Image class at import time so type comparisons
 # work even when tests patch predict_rlm.dspy.Image to a mock.
 _ImageType = dspy.Image
@@ -946,19 +961,15 @@ class PredictRLM(dspy.RLM):
         # Metering + bound for the max-iterations extract fallback. This is a
         # MAIN-LM dspy.Predict call that ``max_llm_calls`` never sees (that
         # counter lives in dspy's closure over the sandbox llm_query tools).
-        #   _run_extract_fallbacks: count for the CURRENT forward() (0 or 1).
-        #       Reset at the start of every forward()/aforward(), this is the
-        #       per-forward budget checked against max_extract_fallbacks and the
-        #       count surfaced on the run trace.
-        #   _extract_fallback_count: lifetime tally across every forward() on
-        #       this instance — surfaced on the trace as extract_fallbacks_total
-        #       so reuse (rollouts / GEPA) stays visible instead of silent.
-        #   _current_max_extract_fallbacks: effective per-forward bound for the
-        #       in-flight run, overridable per call.
+        # The per-forward count and budget live in a local ``_ExtractFallbackState``
+        # created per forward() — NOT on the instance — so concurrent forwards
+        # don't race. Only the lifetime tally below is instance-scoped; it is a
+        # cumulative total across every forward() on this instance, surfaced on
+        # the trace as ``extract_fallbacks_total`` so reuse (rollouts / GEPA)
+        # stays visible. Incremented synchronously (no await between read and
+        # write) so it is atomic under the asyncio event loop.
         self.max_extract_fallbacks = max_extract_fallbacks
         self._extract_fallback_count = 0
-        self._current_max_extract_fallbacks = max_extract_fallbacks
-        self._run_extract_fallbacks = 0
 
     def _create_predict_tool(self) -> Callable[..., dict[str, Any]]:
         """Create the predict tool for running DSPy signatures."""
@@ -1721,23 +1732,24 @@ class PredictRLM(dspy.RLM):
         and File outputs by syncing them back to the host.
 
         Accepts an optional ``max_extract_fallbacks`` keyword that overrides
-        the instance-level bound for this call only.
+        the default bound for this call only.
         """
-        self._set_call_extract_fallback_bound(kwargs)
+        fb_bound = self._pop_extract_fallback_bound(kwargs)
         with self._lm_context():
             file_plan, kwargs = self._prepare_file_io(kwargs)
-            return self._forward_traced(file_plan, **kwargs)
+            return self._forward_traced(file_plan, fb_bound=fb_bound, **kwargs)
 
-    def _set_call_extract_fallback_bound(self, kwargs: dict[str, Any]) -> None:
-        """Apply a per-call ``max_extract_fallbacks`` override, if provided.
+    def _pop_extract_fallback_bound(self, kwargs: dict[str, Any]) -> int:
+        """Resolve this call's per-forward extract-fallback budget.
 
-        Popped from ``kwargs`` so it never leaks into signature-input
-        validation. Absent an override, the instance-level bound applies.
+        Pops a ``max_extract_fallbacks`` override out of ``kwargs`` (so it never
+        leaks into signature-input validation) and returns the effective bound.
+        Absent an override, the instance default applies. The value is returned,
+        not stored on the instance — per-forward state lives in a local
+        ``_ExtractFallbackState`` so concurrent forwards can't race.
         """
         override = kwargs.pop("max_extract_fallbacks", None)
-        self._current_max_extract_fallbacks = (
-            self.max_extract_fallbacks if override is None else override
-        )
+        return self.max_extract_fallbacks if override is None else override
 
     def _build_run_trace(
         self,
@@ -1748,6 +1760,7 @@ class PredictRLM(dspy.RLM):
         lm_hist_start: int,
         sub_hist_start: int,
         run_start: float,
+        extract_fallbacks: int = 0,
     ) -> RunTrace:
         self._phase_log("build_run_trace:enter")
         trace_steps = steps
@@ -1789,7 +1802,7 @@ class PredictRLM(dspy.RLM):
             sub_model=str(getattr(sub_lm, "model", sub_lm)) if sub_lm is not lm else None,
             iterations=len(trace_steps),
             max_iterations=self.max_iterations,
-            extract_fallbacks=getattr(self, "_run_extract_fallbacks", 0),
+            extract_fallbacks=extract_fallbacks,
             extract_fallbacks_total=getattr(self, "_extract_fallback_count", 0),
             duration_ms=ms_since(run_start),
             usage=LMUsage(main=main_usage, **({"sub": sub_usage} if sub_usage else {})),
@@ -1821,15 +1834,15 @@ class PredictRLM(dspy.RLM):
         multiple rollouts concurrently.
 
         Accepts an optional ``max_extract_fallbacks`` keyword that overrides
-        the instance-level bound for this call only.
+        the default bound for this call only.
         """
-        self._set_call_extract_fallback_bound(kwargs)
+        fb_bound = self._pop_extract_fallback_bound(kwargs)
         self._context_lm = dspy.settings.lm
 
         try:
             file_plan, kwargs = self._prepare_file_io(kwargs)
             with self._lm_context():
-                return await self._aforward_traced(file_plan, **kwargs)
+                return await self._aforward_traced(file_plan, fb_bound=fb_bound, **kwargs)
         finally:
             self._context_lm = None
 
@@ -2258,34 +2271,33 @@ class PredictRLM(dspy.RLM):
         variables: list[Any],
         history: Any,
         output_field_names: list[str],
+        state: "_ExtractFallbackState",
     ) -> dspy.Prediction:
         """Meter + bound the sync max-iterations extract fallback.
 
         ``_extract_fallback`` (inherited from dspy) makes ONE dspy.Predict call
-        on the MAIN LM that ``max_llm_calls`` cannot see. Track it on a
-        per-forward counter and gate it behind ``max_extract_fallbacks`` (reset
-        each forward, default 1) so the metering is visible per run without
-        silently degrading reused instances. When the per-forward bound is
-        exhausted, skip the LM call and return the degraded outcome.
+        on the MAIN LM that ``max_llm_calls`` cannot see. Track it on the
+        per-forward ``state`` (local to this invocation — never instance state,
+        so concurrent forwards don't race) and gate it behind that run's budget
+        (default 1) so the metering is visible per run without silently
+        degrading reused instances. When the per-forward budget is exhausted,
+        skip the LM call and return the degraded outcome.
         """
-        bound = getattr(
-            self, "_current_max_extract_fallbacks", self.max_extract_fallbacks
-        )
         start_ns = time.time_ns()
-        if self._run_extract_fallbacks >= bound:
+        if state.count >= state.bound:
             self._write_telemetry_span(
                 "rlm.extract_fallback.skipped",
-                attributes=self._extract_fallback_attrs(bound),
+                attributes=self._extract_fallback_attrs(state),
                 start_time_unix_nano=start_ns,
             )
             return self._extract_fallback_skipped(
                 variables, history, output_field_names
             )
-        self._run_extract_fallbacks += 1
-        self._extract_fallback_count += 1
+        state.count += 1
+        self._extract_fallback_count += 1  # lifetime total (atomic under asyncio)
         self._write_telemetry_span(
             "rlm.extract_fallback.ok",
-            attributes=self._extract_fallback_attrs(bound),
+            attributes=self._extract_fallback_attrs(state),
             start_time_unix_nano=start_ns,
         )
         return self._extract_fallback(variables, history, output_field_names)
@@ -2295,35 +2307,33 @@ class PredictRLM(dspy.RLM):
         variables: list[Any],
         history: Any,
         output_field_names: list[str],
+        state: "_ExtractFallbackState",
     ) -> dspy.Prediction:
         """Async twin of :meth:`_run_extract_fallback`."""
-        bound = getattr(
-            self, "_current_max_extract_fallbacks", self.max_extract_fallbacks
-        )
         start_ns = time.time_ns()
-        if self._run_extract_fallbacks >= bound:
+        if state.count >= state.bound:
             self._write_telemetry_span(
                 "rlm.extract_fallback.skipped",
-                attributes=self._extract_fallback_attrs(bound),
+                attributes=self._extract_fallback_attrs(state),
                 start_time_unix_nano=start_ns,
             )
             return self._extract_fallback_skipped(
                 variables, history, output_field_names
             )
-        self._run_extract_fallbacks += 1
-        self._extract_fallback_count += 1
+        state.count += 1
+        self._extract_fallback_count += 1  # lifetime total (atomic under asyncio)
         self._write_telemetry_span(
             "rlm.extract_fallback.ok",
-            attributes=self._extract_fallback_attrs(bound),
+            attributes=self._extract_fallback_attrs(state),
             start_time_unix_nano=start_ns,
         )
         return await self._aextract_fallback(variables, history, output_field_names)
 
-    def _extract_fallback_attrs(self, bound: int) -> dict[str, Any]:
+    def _extract_fallback_attrs(self, state: "_ExtractFallbackState") -> dict[str, Any]:
         return {
-            "extract_fallbacks": self._run_extract_fallbacks,
+            "extract_fallbacks": state.count,
             "extract_fallbacks_total": self._extract_fallback_count,
-            "max_extract_fallbacks": bound,
+            "max_extract_fallbacks": state.bound,
         }
 
     def _extract_fallback_skipped(
@@ -2355,7 +2365,11 @@ class PredictRLM(dspy.RLM):
         )
 
     def _forward_traced(
-        self, file_plan: dict[str, Any] | None, **input_args: Any
+        self,
+        file_plan: dict[str, Any] | None,
+        *,
+        fb_bound: int | None = None,
+        **input_args: Any,
     ) -> dspy.Prediction:
         """Execute forward() with tracing and optional file I/O."""
         _, output_file_fields = scan_file_fields(self.signature) if file_plan else (None, {})
@@ -2368,7 +2382,11 @@ class PredictRLM(dspy.RLM):
 
         run_start = time.perf_counter()
         self._run_start = run_start  # anchor for _phase_log elapsed timings
-        self._run_extract_fallbacks = 0  # per-forward count surfaced on the trace
+        # Per-forward extract-fallback metering — LOCAL state so concurrent
+        # forwards on this instance don't race on a shared counter/budget.
+        fb_state = _ExtractFallbackState(
+            bound=self.max_extract_fallbacks if fb_bound is None else fb_bound
+        )
         lm = dspy.settings.lm
         sub_lm = self._sub_lm
         # Per-RLM instance ``lm`` has its own history (via ``lm.copy()``
@@ -2445,7 +2463,7 @@ class PredictRLM(dspy.RLM):
                         history = result
                     else:
                         prediction = self._run_extract_fallback(
-                            variables, history, output_field_names
+                            variables, history, output_field_names, fb_state
                         )
                         if output_file_fields:
                             self._sync_output_files(
@@ -2460,6 +2478,7 @@ class PredictRLM(dspy.RLM):
                         lm_hist_start=lm_hist_start,
                         sub_hist_start=sub_hist_start,
                         run_start=run_start,
+                        extract_fallbacks=fb_state.count,
                     )
                     return prediction
                 finally:
@@ -2475,6 +2494,7 @@ class PredictRLM(dspy.RLM):
                     lm_hist_start=lm_hist_start,
                     sub_hist_start=sub_hist_start,
                     run_start=run_start,
+                    extract_fallbacks=fb_state.count,
                 )
             except Exception:
                 pass
@@ -2485,7 +2505,11 @@ class PredictRLM(dspy.RLM):
                 self.generate_action, self.extract = orig_action, orig_extract
 
     async def _aforward_traced(
-        self, file_plan: dict[str, Any] | None, **input_args: Any
+        self,
+        file_plan: dict[str, Any] | None,
+        *,
+        fb_bound: int | None = None,
+        **input_args: Any,
     ) -> dspy.Prediction:
         """Execute aforward() with tracing and optional file I/O."""
         _, output_file_fields = scan_file_fields(self.signature) if file_plan else (None, {})
@@ -2498,7 +2522,11 @@ class PredictRLM(dspy.RLM):
 
         run_start = time.perf_counter()
         self._run_start = run_start  # anchor for _phase_log elapsed timings
-        self._run_extract_fallbacks = 0  # per-forward count surfaced on the trace
+        # Per-forward extract-fallback metering — LOCAL state so concurrent
+        # aforwards on this instance don't race on a shared counter/budget.
+        fb_state = _ExtractFallbackState(
+            bound=self.max_extract_fallbacks if fb_bound is None else fb_bound
+        )
         lm = dspy.settings.lm
         sub_lm = self._sub_lm
         # Snapshot lm.history lengths at run start so ``usage_since`` can
@@ -2577,7 +2605,7 @@ class PredictRLM(dspy.RLM):
                         history = result
                     else:
                         prediction = await self._arun_extract_fallback(
-                            variables, history, output_field_names
+                            variables, history, output_field_names, fb_state
                         )
                         if output_file_fields:
                             self._sync_output_files(
@@ -2592,6 +2620,7 @@ class PredictRLM(dspy.RLM):
                         lm_hist_start=lm_hist_start,
                         sub_hist_start=sub_hist_start,
                         run_start=run_start,
+                        extract_fallbacks=fb_state.count,
                     )
                     return prediction
                 finally:
@@ -2607,6 +2636,7 @@ class PredictRLM(dspy.RLM):
                     lm_hist_start=lm_hist_start,
                     sub_hist_start=sub_hist_start,
                     run_start=run_start,
+                    extract_fallbacks=fb_state.count,
                 )
             except Exception:
                 pass

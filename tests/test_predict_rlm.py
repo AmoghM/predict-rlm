@@ -1073,9 +1073,60 @@ class TestExtractFallbackMetering:
             ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=1
         )
         kwargs = {"images": ["img"], "query": "q", "max_extract_fallbacks": 5}
-        rlm._set_call_extract_fallback_bound(kwargs)
+        bound = rlm._pop_extract_fallback_bound(kwargs)
+        # Override is popped (never leaks into signature inputs) and returned,
+        # not stored on the instance — per-forward state is local.
         assert "max_extract_fallbacks" not in kwargs
-        assert rlm._current_max_extract_fallbacks == 5
+        assert bound == 5
+        assert not hasattr(rlm, "_current_max_extract_fallbacks")
+
+    @pytest.mark.asyncio
+    async def test_concurrent_aforwards_do_not_race_on_metering(self):
+        # Two concurrent forwards on ONE instance, both hitting max_iterations,
+        # must EACH get their own fallback with a per-run count of 1. Shared
+        # instance-attribute counters would let one run's increment make the
+        # other skip its fallback (or read the wrong trace value).
+        rlm = PredictRLM(
+            ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=1
+        )
+        context = self._looping_context()
+
+        async def slow_iter(*_args, **_kwargs):
+            await asyncio.sleep(0)  # force interleaving between the two runs
+            return REPLHistory(
+                entries=[REPLEntry(reasoning="r", code="c", output="o")]
+            )
+
+        async def slow_fallback(*_args, **_kwargs):
+            await asyncio.sleep(0)  # yield inside the critical section
+            return dspy.Prediction(
+                answer="x",
+                trajectory=[],
+                final_reasoning="Extract forced final output",
+            )
+
+        with (
+            patch.object(PredictRLM, "_interpreter_context", return_value=context),
+            patch.object(PredictRLM, "_prepare_execution_tools", return_value={}),
+            patch.object(PredictRLM, "_build_variables", return_value=[]),
+            patch.object(
+                rlm, "_aexecute_iteration", new=AsyncMock(side_effect=slow_iter)
+            ),
+            patch.object(
+                rlm, "_aextract_fallback", new=AsyncMock(side_effect=slow_fallback)
+            ) as mock_fb,
+        ):
+            first, second = await asyncio.gather(
+                rlm._aforward_traced(None, images=["img"], query="q"),
+                rlm._aforward_traced(None, images=["img"], query="q"),
+            )
+
+        assert mock_fb.await_count == 2
+        assert first.trace.extract_fallbacks == 1
+        assert second.trace.extract_fallbacks == 1
+        assert first.trace.status == "max_iterations"
+        assert second.trace.status == "max_iterations"
+        assert rlm._extract_fallback_count == 2  # lifetime total across both
 
 
 class TestModelsFromSchema:
