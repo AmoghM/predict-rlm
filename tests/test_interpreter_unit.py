@@ -140,11 +140,26 @@ class TestBuildDenoCommand:
         assert not any(a.startswith("--allow-net") for a in cmd)
 
     @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)
-    def test_always_includes_allow_env_and_no_prompt(self, _):
+    def test_scoped_allow_env_allowlist_and_no_prompt(self, _):
         interp = _make_interpreter()
         with patch.object(interp, "_get_deno_dir", return_value=[]):
-            cmd = interp._build_deno_command([], [], [], [])
-        assert "--allow-env" in cmd
+            cmd = interp._build_deno_command(
+                [], [], [], ["PYODIDE_PREINSTALL", "SKILL_PACKAGES", "MY_VAR"]
+            )
+        # No bare --allow-env grant remains (that would read ALL host vars).
+        assert "--allow-env" not in cmd
+        # Exactly one scoped --allow-env=<list> arg is present.
+        scoped = [a for a in cmd if a.startswith("--allow-env=")]
+        assert len(scoped) == 1
+        allowlist = scoped[0][len("--allow-env="):].split(",")
+        # Base startup vars are always present.
+        for base in ("HOME", "DENO_DIR", "TMPDIR", "PYODIDE_PREINSTALL",
+                     "SKILL_PACKAGES"):
+            assert base in allowlist
+        # All caller-supplied env_vars are present.
+        assert "MY_VAR" in allowlist
+        # No duplicates (e.g. PYODIDE_PREINSTALL appears once).
+        assert len(allowlist) == len(set(allowlist))
         assert "--no-prompt" in cmd
 
     @patch("predict_rlm.interpreter._needs_jspi_flag", return_value=False)

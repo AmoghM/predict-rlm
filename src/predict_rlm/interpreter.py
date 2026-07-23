@@ -520,9 +520,25 @@ class JspiInterpreter(PythonInterpreter):
         if network_access:
             args.append(f"--allow-net={','.join(network_access)}")
 
-        # Allow env var access — Deno and Pyodide need HOME, DENO_DIR, etc.
-        # during startup, so we allow all env vars rather than restricting.
-        args.append("--allow-env")
+        # Scope env var access to an explicit allowlist so LLM-authored
+        # sandbox code cannot read host secrets (API keys, etc.) via the
+        # inherited environment. The base set covers vars Deno/Pyodide read
+        # during startup (HOME, DENO_DIR, TMPDIR) plus the runner control
+        # vars (PYODIDE_PREINSTALL, SKILL_PACKAGES). env_vars carries any
+        # caller-supplied names plus those control vars; merge and dedupe
+        # while preserving deterministic (base-first) order.
+        base_env_allowlist = [
+            "HOME",
+            "DENO_DIR",
+            "TMPDIR",
+            "PYODIDE_PREINSTALL",
+            "SKILL_PACKAGES",
+        ]
+        allowed_env: list[str] = []
+        for name in [*base_env_allowlist, *env_vars]:
+            if name not in allowed_env:
+                allowed_env.append(name)
+        args.append("--allow-env=" + ",".join(allowed_env))
 
         # Use Deno's global cache for npm: specifiers instead of a parent
         # node_modules (e.g. one created by `prisma generate`). Without this,
