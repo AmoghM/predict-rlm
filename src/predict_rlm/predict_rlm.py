@@ -72,6 +72,18 @@ from .trace import (
 _CB_LOGGER = logging.getLogger("predict_rlm.callbacks")
 logger = logging.getLogger(__name__)
 
+# Bounded defaults for LMs this library CONSTRUCTS from a model string.
+# Without them the only bounds in play are dspy's num_retries=3 and
+# litellm's ~600s request timeout, so one wedged provider call can stall a
+# forward() for ~40 minutes with no way for the caller to bound it short of
+# building the dspy.LM themselves.
+#
+# These apply ONLY to the string-construction path. An LM OBJECT handed in by
+# a host passes through untouched — hosts already configure their own bounds
+# and silently rewriting them would be worse than the unbounded default.
+DEFAULT_LM_NUM_RETRIES = 2
+DEFAULT_LM_TIMEOUT = 120
+
 
 @dataclass
 class _IterationCallbackState:
@@ -763,6 +775,8 @@ class PredictRLM(dspy.RLM):
         signature: type[Signature] | str,
         lm: dspy.LM | str | None = None,
         sub_lm: dspy.LM | str | None = None,
+        lm_num_retries: int = DEFAULT_LM_NUM_RETRIES,
+        lm_timeout: float | None = DEFAULT_LM_TIMEOUT,
         max_iterations: int = 30,
         max_llm_calls: int = 50,
         max_extract_fallbacks: int = 1,
@@ -789,6 +803,18 @@ class PredictRLM(dspy.RLM):
             sub_lm: LM for the predict tool. Can be a dspy.LM instance or a model
                    string like "anthropic/claude-haiku-4-5". If None, uses the
                    current context LM (from dspy.settings.lm or dspy.context).
+            lm_num_retries: Retry budget for LMs this class CONSTRUCTS from a
+                          model string (both ``lm`` and ``sub_lm``). Defaults to
+                          2 — tighter than dspy's own default of 3. Ignored when
+                          an LM object is passed instead of a string: that object
+                          is used exactly as the host configured it.
+            lm_timeout: Per-request timeout (seconds) for LMs this class
+                          CONSTRUCTS from a model string. Defaults to 120s —
+                          far tighter than litellm's ~600s default, so a wedged
+                          provider call can't stall a forward() for tens of
+                          minutes. Pass None to fall back to litellm's default.
+                          Ignored on the LM-object path, same as
+                          ``lm_num_retries``.
             max_iterations: Maximum REPL interaction iterations.
             max_llm_calls: Maximum LM calls per execution. NOTE: this is a
                           dspy-internal counter that covers ONLY sandbox
@@ -868,17 +894,25 @@ class PredictRLM(dspy.RLM):
         # make each call's usage_since delta include every other
         # concurrent call's history entries. Cache / callbacks / config
         # stay shared by reference; only the ``history`` list is reset.
+        #
+        # Model STRINGS additionally get bounded retry/timeout defaults (see
+        # DEFAULT_LM_NUM_RETRIES / DEFAULT_LM_TIMEOUT). LM OBJECTS never do —
+        # a host that built its own dspy.LM already chose its bounds.
+        bounds: dict[str, Any] = {"num_retries": lm_num_retries}
+        if lm_timeout is not None:
+            bounds["timeout"] = lm_timeout
+
         if lm is None:
             self._lm = None
         elif isinstance(lm, str):
-            self._lm = dspy.LM(lm, cache=False)
+            self._lm = dspy.LM(lm, cache=False, **bounds)
         else:
             self._lm = lm.copy() if hasattr(lm, "copy") else lm
 
         if sub_lm is None:
             self._sub_lm = None
         elif isinstance(sub_lm, str):
-            self._sub_lm = dspy.LM(sub_lm, cache=False)
+            self._sub_lm = dspy.LM(sub_lm, cache=False, **bounds)
         else:
             self._sub_lm = sub_lm.copy() if hasattr(sub_lm, "copy") else sub_lm
 
