@@ -138,6 +138,15 @@ class SbxConfig(BaseModel):
     exec_timeout: float = 300.0
     shutdown_timeout: float = 2.0
 
+    # Wall-clock budget for a single host-side tool call, mirroring the JSPI
+    # backend's ``TOOL_CALL_TIMEOUT_SEC``. Exceeding it returns a RECOVERABLE
+    # error to the sandbox ("tool ... timed out after Ns") instead of letting
+    # ``exec_timeout`` expire, which kills the runner process and turns a slow
+    # tool into an unrecoverable ``SandboxFatalError``. Must stay below
+    # ``exec_timeout`` so the tool guard fires first; values that don't are
+    # clamped (see ``SbxInterpreter._tool_call_budget``).
+    tool_call_timeout: float = 180.0
+
     # Runtime selection and plain-Docker / host-subprocess options. Defaults
     # preserve the original ``sbx`` CLI behavior.
     runtime: Literal["sbx", "docker", "host"] = "sbx"

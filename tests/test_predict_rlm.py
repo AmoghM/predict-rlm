@@ -12,7 +12,11 @@ from dspy.primitives.repl_types import REPLEntry, REPLHistory
 from pydantic import BaseModel
 
 from predict_rlm import PredictRLM, SbxPool
-from predict_rlm.predict_rlm import _models_from_schema
+from predict_rlm.predict_rlm import (
+    DEFAULT_LM_NUM_RETRIES,
+    DEFAULT_LM_TIMEOUT,
+    _models_from_schema,
+)
 from predict_rlm.rlm_skills import Skill
 from predict_rlm.telemetry import TelemetryContext, classify_failure
 from predict_rlm.trace import drain_predict_calls, init_predict_call_collector
@@ -676,7 +680,12 @@ class TestMainLMParameter:
         with patch("predict_rlm.predict_rlm.dspy.LM") as mock_lm_class:
             mock_lm_class.return_value = MagicMock()
             rlm = PredictRLM(ImageAnalysisSignature, lm="openai/gpt-4o", max_iterations=1)
-            mock_lm_class.assert_any_call("openai/gpt-4o", cache=False)
+            mock_lm_class.assert_any_call(
+                "openai/gpt-4o",
+                cache=False,
+                num_retries=DEFAULT_LM_NUM_RETRIES,
+                timeout=DEFAULT_LM_TIMEOUT,
+            )
             assert rlm._lm is mock_lm_class.return_value
 
     def test_lm_none_by_default(self):
@@ -771,6 +780,98 @@ class TestMainLMParameter:
         )
         assert rlm._lm is mock_lm.copy.return_value
         assert rlm._sub_lm is mock_sub_lm.copy.return_value
+
+    def test_string_lm_gets_bounded_defaults(self):
+        """A model STRING gets library-side bounded retry/timeout defaults.
+
+        Without them the only bounds are dspy's num_retries=3 and
+        litellm's ~600s request timeout, so a single wedged forward can
+        block for ~40 minutes.
+        """
+        with patch("predict_rlm.predict_rlm.dspy.LM") as mock_lm_class:
+            PredictRLM(
+                ImageAnalysisSignature,
+                lm="openai/gpt-4o",
+                sub_lm="openai/gpt-4o-mini",
+                max_iterations=1,
+            )
+
+        for model in ("openai/gpt-4o", "openai/gpt-4o-mini"):
+            mock_lm_class.assert_any_call(
+                model,
+                cache=False,
+                num_retries=DEFAULT_LM_NUM_RETRIES,
+                timeout=DEFAULT_LM_TIMEOUT,
+            )
+
+    def test_bounded_defaults_are_actually_bounded(self):
+        """The defaults are tighter than dspy/litellm's own defaults."""
+        assert DEFAULT_LM_NUM_RETRIES == 2
+        assert DEFAULT_LM_TIMEOUT == 120
+
+    def test_string_lm_honors_explicit_bounds(self):
+        """lm_num_retries / lm_timeout override the defaults on both LMs."""
+        with patch("predict_rlm.predict_rlm.dspy.LM") as mock_lm_class:
+            PredictRLM(
+                ImageAnalysisSignature,
+                lm="openai/gpt-4o",
+                sub_lm="openai/gpt-4o-mini",
+                lm_num_retries=7,
+                lm_timeout=45,
+                max_iterations=1,
+            )
+
+        for model in ("openai/gpt-4o", "openai/gpt-4o-mini"):
+            mock_lm_class.assert_any_call(
+                model, cache=False, num_retries=7, timeout=45
+            )
+
+    def test_lm_object_path_untouched_by_bounds(self):
+        """Host-passed LM objects pass through UNTOUCHED.
+
+        Hosts configure their own num_retries/timeout; the library must
+        not silently rewrite them, even when lm_num_retries/lm_timeout
+        are explicitly set.
+        """
+        mock_lm = MagicMock(spec=dspy.LM)
+        mock_copy = MagicMock(spec=dspy.LM)
+        mock_lm.copy.return_value = mock_copy
+        mock_sub_lm = MagicMock(spec=dspy.LM)
+        mock_sub_copy = MagicMock(spec=dspy.LM)
+        mock_sub_lm.copy.return_value = mock_sub_copy
+
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            lm=mock_lm,
+            sub_lm=mock_sub_lm,
+            lm_num_retries=7,
+            lm_timeout=45,
+            max_iterations=1,
+        )
+
+        assert rlm._lm is mock_copy
+        assert rlm._sub_lm is mock_sub_copy
+        # No attribute rewriting on the copies.
+        for obj in (mock_copy, mock_sub_copy):
+            assert "num_retries" not in getattr(obj, "__dict__", {})
+            assert not obj.method_calls
+            assert not obj.mock_calls
+
+    def test_lm_object_without_copy_passes_through(self):
+        """An LM object lacking .copy() is stored as-is, unmodified."""
+
+        class BareLM:
+            def __init__(self):
+                self.num_retries = 99
+                self.timeout = 999
+
+        bare = BareLM()
+        rlm = PredictRLM(
+            ImageAnalysisSignature, lm=bare, lm_num_retries=1, max_iterations=1
+        )
+        assert rlm._lm is bare
+        assert bare.num_retries == 99
+        assert bare.timeout == 999
 
     @pytest.mark.asyncio
     async def test_aforward_uses_lm_as_context(self):
