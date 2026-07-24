@@ -567,6 +567,56 @@ while True:
         assert errors == []
         assert sorted(results) == ["first", "second"]
 
+    @pytest.mark.asyncio
+    async def test_aexecute_matches_execute(self, tmp_path: Path):
+        """aexecute is the async face of execute, sharing runner state."""
+        interpreter = self.make_interpreter(tmp_path)
+        try:
+            assert await interpreter.aexecute("x = 7\nprint(x)") == "7\n"
+            # Same runner, same session state as the sync path.
+            assert interpreter.execute("print(x + 1)") == "8\n"
+            assert await interpreter.aexecute("print(x + 2)") == "9\n"
+
+            result = await interpreter.aexecute("SUBMIT(answer='ok')")
+            assert isinstance(result, FinalOutput)
+            assert result.output == {"answer": "ok"}
+
+            with pytest.raises(CodeInterpreterError, match="NameError"):
+                await interpreter.aexecute("print(missing_name)")
+        finally:
+            interpreter.shutdown()
+
+    @pytest.mark.asyncio
+    async def test_aexecute_does_not_block_the_event_loop(self, tmp_path: Path):
+        """The transport is blocking sync I/O, so aexecute offloads to a
+        worker thread. It must not stall the loop: a concurrent task has
+        to keep making progress while an execute is in flight.
+
+        This pins the documented contract — the loop stays responsive even
+        though the interpreter itself is not natively async.
+        """
+        interpreter = self.make_interpreter(tmp_path)
+        ticks = 0
+
+        async def tick() -> None:
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        ticker = asyncio.create_task(tick())
+        try:
+            output = await interpreter.aexecute("import time\ntime.sleep(0.3)\nprint('slept')")
+        finally:
+            ticker.cancel()
+            interpreter.shutdown()
+
+        assert output.strip() == "slept"
+        assert ticks > 5, (
+            f"the event loop only advanced {ticks} times during a 0.3s "
+            "aexecute — it was blocked"
+        )
+
     def test_concurrent_host_tool_calls_do_not_run_serially(self, tmp_path: Path):
         async def slow(value: int) -> int:
             await asyncio.sleep(0.35)
