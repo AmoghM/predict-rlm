@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,6 +34,29 @@ from .base import (
 RUNNER_PATH = Path(__file__).parents[1] / "sandbox" / "python_runner.py"
 DEFAULT_PACKAGE_DOMAINS = ["pypi.org", "files.pythonhosted.org"]
 SBX_PYTHON_EXECUTABLE = "python3"
+
+# Fraction of ``exec_timeout`` the per-tool budget may consume. The tool guard
+# only helps if it fires BEFORE the whole-request wall — that wall kills the
+# runner process — so a ``tool_call_timeout`` that meets or exceeds
+# ``exec_timeout`` is clamped to leave the request loop room to write the
+# error response back to the sandbox.
+TOOL_TIMEOUT_EXEC_FRACTION = 0.9
+
+
+@dataclass
+class _PendingToolCall:
+    """Bookkeeping for one in-flight host tool call.
+
+    ``deadline`` is measured from SUBMIT, not from the moment the tool
+    actually starts running, so queueing behind a wedged predecessor counts
+    against the budget too. That's deliberate: the budget bounds what the
+    sandbox waits for, which is the thing ``exec_timeout`` would otherwise
+    punish with a runner kill.
+    """
+
+    request_id: Any
+    name: str | None
+    deadline: float
 
 
 class SbxInterpreter(PredictRLMInterpreter):
@@ -94,7 +118,9 @@ class SbxInterpreter(PredictRLMInterpreter):
         self._tool_executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=max(4, len(self.tools) or 1)
         )
-        self._pending_tool_calls: dict[concurrent.futures.Future[dict[str, Any]], int] = {}
+        self._pending_tool_calls: dict[
+            concurrent.futures.Future[dict[str, Any]], _PendingToolCall
+        ] = {}
         self._execution_gate = InterpreterExecutionGate("SBX interpreter")
         self._sandbox_name: str | None = None
         self._request_id = 0
@@ -123,6 +149,34 @@ class SbxInterpreter(PredictRLMInterpreter):
     async def aexecute(
         self, code: str, variables: dict[str, Any] | None = None
     ) -> Any:
+        """Async-compatible ``execute``. NOT natively async.
+
+        This backend's JSON-RPC transport is blocking sync I/O end to end:
+        ``_send_request`` writes to the runner's stdin and then spins on a
+        ``queue.Queue`` fed by a stdout reader thread, polling for tool-call
+        requests along the way. There is no asyncio transport underneath, so
+        ``aexecute`` offloads the whole blocking round-trip to a worker
+        thread via ``asyncio.to_thread``. The event loop stays responsive —
+        a concurrent task runs normally while an execute is in flight — but
+        two consequences follow from the thread-pool mechanism:
+
+        - **Concurrency is bounded by the default thread pool**, not by the
+          loop. ``asyncio.to_thread`` uses the loop's default executor
+          (``min(32, cpu_count + 4)`` workers on CPython 3.11). Parallel
+          forwards past that bound queue behind in-flight ones and their
+          ``exec_timeout`` deadline — which starts *inside* ``execute``,
+          after the thread is allocated — is unaffected by that queueing,
+          so the wait is invisible to the per-request timeout.
+        - **One interpreter still serializes.** ``execute`` acquires this
+          interpreter's ``InterpreterExecutionGate``, so concurrent
+          ``aexecute`` calls on the SAME instance queue on that gate. Use an
+          ``SbxPool`` (one interpreter per concurrent forward) for real
+          parallelism.
+
+        Host tool callbacks invoked during the run are dispatched on the
+        interpreter's own tool executor, not on this thread, and are bounded
+        by ``SbxConfig.tool_call_timeout``.
+        """
         return await asyncio.to_thread(self.execute, code, variables)
 
     def mount_file_at(self, host_path: str, virtual_path: str) -> None:
@@ -578,19 +632,106 @@ class SbxInterpreter(PredictRLMInterpreter):
             f"Sbx runner request timed out after {self.config.exec_timeout}s"
         )
 
+    def _tool_call_budget(self) -> float:
+        """Effective wall-clock budget for one host tool call.
+
+        Clamped below ``exec_timeout`` so the recoverable tool guard always
+        fires before the unrecoverable whole-request wall (which kills the
+        runner). See ``TOOL_TIMEOUT_EXEC_FRACTION``.
+        """
+        return min(
+            self.config.tool_call_timeout,
+            self.config.exec_timeout * TOOL_TIMEOUT_EXEC_FRACTION,
+        )
+
     def _submit_tool_call(self, request: dict[str, Any]) -> None:
-        request_id = request.get("id")
+        params = request.get("params", {}) or {}
         future = self._tool_executor.submit(self._build_tool_response, request)
-        self._pending_tool_calls[future] = request_id
+        self._pending_tool_calls[future] = _PendingToolCall(
+            request_id=request.get("id"),
+            name=params.get("name"),
+            deadline=time.monotonic() + self._tool_call_budget(),
+        )
 
     def _drain_completed_tool_calls(self) -> None:
-        completed = [
-            future for future in self._pending_tool_calls
-            if future.done()
+        for future in [f for f in self._pending_tool_calls if f.done()]:
+            pending = self._pending_tool_calls.pop(future)
+            self._write_tool_response(self._settled_tool_response(future, pending))
+
+        now = time.monotonic()
+        overdue = [
+            (future, pending)
+            for future, pending in self._pending_tool_calls.items()
+            if now > pending.deadline
         ]
-        for future in completed:
+        for future, pending in overdue:
             self._pending_tool_calls.pop(future)
-            self._write_tool_response(future.result())
+            if future.done():
+                # Landed between the two scans — keep the real result.
+                self._write_tool_response(self._settled_tool_response(future, pending))
+                continue
+            self._abandon_tool_call(future, pending)
+
+    def _settled_tool_response(
+        self,
+        future: concurrent.futures.Future[dict[str, Any]],
+        pending: _PendingToolCall,
+    ) -> dict[str, Any]:
+        """Unwrap a finished tool future into a JSON-RPC response.
+
+        ``_build_tool_response`` catches its own exceptions, so the only way
+        ``result()`` raises here is a future cancelled by executor recycling
+        (see ``_abandon_tool_call``). The sandbox is still blocked on a
+        response either way, so turn that into a recoverable error rather
+        than letting it escape into the request loop.
+        """
+        try:
+            return future.result()
+        except Exception as exc:
+            return self._tool_error_response(
+                pending.request_id,
+                f"tool {pending.name!r} was dropped before it completed: {exc}",
+            )
+
+    def _abandon_tool_call(
+        self,
+        future: concurrent.futures.Future[dict[str, Any]],
+        pending: _PendingToolCall,
+    ) -> None:
+        """Give up on an over-budget tool call without killing the sandbox.
+
+        A running Python thread can't be killed, so the wedged call is left
+        to finish into the void and the executor is replaced — otherwise
+        repeated hangs would permanently consume workers and starve every
+        later tool call. The sandbox gets a normal error response, so
+        ``await tool()`` raises in-sandbox and the RLM can rewrite its code.
+        """
+        future.cancel()
+        self._recycle_tool_executor()
+        self._write_tool_response(
+            self._tool_error_response(
+                pending.request_id,
+                f"tool {pending.name!r} timed out after "
+                f"{self._tool_call_budget()}s (per-call budget)",
+            )
+        )
+
+    def _recycle_tool_executor(self) -> None:
+        stale = self._tool_executor
+        self._tool_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(4, len(self.tools) or 1)
+        )
+        # ``wait=False`` so the abandoned thread doesn't block the request
+        # loop; queued-but-unstarted calls surface via _settled_tool_response.
+        stale.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _tool_error_response(request_id: Any, message: str) -> dict[str, Any]:
+        return {
+            "jsonrpc": "2.0",
+            "error": {"code": -32000, "message": message},
+            "id": request_id,
+        }
 
     def _build_tool_response(self, request: dict[str, Any]) -> dict[str, Any]:
         request_id = request.get("id")
@@ -625,11 +766,7 @@ class SbxInterpreter(PredictRLMInterpreter):
                 "id": request_id,
             }
         except Exception as exc:
-            return {
-                "jsonrpc": "2.0",
-                "error": {"code": -32000, "message": str(exc)},
-                "id": request_id,
-            }
+            return self._tool_error_response(request_id, str(exc))
         finally:
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
