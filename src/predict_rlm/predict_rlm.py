@@ -11,7 +11,7 @@ import time
 import types
 from contextlib import asynccontextmanager, contextmanager
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -83,6 +83,28 @@ logger = logging.getLogger(__name__)
 # and silently rewriting them would be worse than the unbounded default.
 DEFAULT_LM_NUM_RETRIES = 2
 DEFAULT_LM_TIMEOUT = 120
+
+
+@dataclass
+class _TracedRun:
+    """Per-invocation state for one traced (a)forward().
+
+    Everything here is LOCAL to a single call — never instance state — so
+    concurrent forwards on one PredictRLM (e.g. asyncio.gather over rollouts)
+    can't race on counters, snapshots, or the swapped-in signatures.
+    """
+
+    file_plan: dict[str, Any] | None
+    output_file_fields: dict[str, Any]
+    orig_action: Any
+    orig_extract: Any
+    run_start: float
+    fb_state: "_ExtractFallbackState"
+    lm: Any
+    sub_lm: Any
+    lm_hist_start: int
+    sub_hist_start: int
+    steps: list[IterationStep] = field(default_factory=list)
 
 
 @dataclass
@@ -1703,6 +1725,35 @@ class PredictRLM(dspy.RLM):
                     "Error in RLM callback %s.%s: %s", type(cb).__name__, method, e
                 )
 
+    def _iteration_start_payload(
+        self, call_id: str | None, iteration: int
+    ) -> dict[str, Any]:
+        """Callback kwargs for ``on_rlm_iteration_start``.
+
+        Built here rather than inline so the sync and async scopes below —
+        which can't be one function, since a sync generator and an async
+        generator are different objects — can't drift in what they report.
+        """
+        return dict(
+            call_id=call_id,
+            instance=self,
+            iteration=iteration + 1,
+            max_iterations=self.max_iterations,
+        )
+
+    def _iteration_end_payload(
+        self, call_id: str | None, iteration: int, state: _IterationCallbackState
+    ) -> dict[str, Any]:
+        """Callback kwargs for ``on_rlm_iteration_end``. See above."""
+        return dict(
+            call_id=call_id,
+            instance=self,
+            iteration=iteration + 1,
+            step=state.step,
+            is_final=state.is_final,
+            exception=state.exception,
+        )
+
     @contextmanager
     def _iteration_callback_scope(
         self, call_id: str | None, iteration: int
@@ -1710,10 +1761,7 @@ class PredictRLM(dspy.RLM):
         state = _IterationCallbackState()
         self._dispatch_sync(
             "on_rlm_iteration_start",
-            call_id=call_id,
-            instance=self,
-            iteration=iteration + 1,
-            max_iterations=self.max_iterations,
+            **self._iteration_start_payload(call_id, iteration),
         )
         try:
             yield state
@@ -1723,12 +1771,7 @@ class PredictRLM(dspy.RLM):
         finally:
             self._dispatch_sync(
                 "on_rlm_iteration_end",
-                call_id=call_id,
-                instance=self,
-                iteration=iteration + 1,
-                step=state.step,
-                is_final=state.is_final,
-                exception=state.exception,
+                **self._iteration_end_payload(call_id, iteration, state),
             )
 
     @asynccontextmanager
@@ -1738,10 +1781,7 @@ class PredictRLM(dspy.RLM):
         state = _IterationCallbackState()
         await self._dispatch_async(
             "on_rlm_iteration_start",
-            call_id=call_id,
-            instance=self,
-            iteration=iteration + 1,
-            max_iterations=self.max_iterations,
+            **self._iteration_start_payload(call_id, iteration),
         )
         try:
             yield state
@@ -1751,12 +1791,7 @@ class PredictRLM(dspy.RLM):
         finally:
             await self._dispatch_async(
                 "on_rlm_iteration_end",
-                call_id=call_id,
-                instance=self,
-                iteration=iteration + 1,
-                step=state.step,
-                is_final=state.is_final,
-                exception=state.exception,
+                **self._iteration_end_payload(call_id, iteration, state),
             )
 
     def forward(self, **kwargs: Any) -> dspy.Prediction:
@@ -1880,17 +1915,12 @@ class PredictRLM(dspy.RLM):
         finally:
             self._context_lm = None
 
-    def _execute_iteration(
-        self,
-        repl,
-        variables,
-        history,
-        iteration,
-        input_args,
-        output_field_names,
-    ):
-        """Execute one synchronous RLM iteration with PredictRLM validation."""
-        variables_info = [variable.format() for variable in variables]
+    def _begin_action_generation(self, iteration: int) -> tuple[int, int]:
+        """Open the action-generation span and snapshot LM history.
+
+        Returns ``(span_start_ns, lm_history_len)`` — both needed by whichever
+        of ``_record_action_error`` / ``_record_action_ok`` closes the span.
+        """
         action_start_ns = time.time_ns()
         self._write_telemetry_span(
             "rlm.action_generation.start",
@@ -1898,37 +1928,49 @@ class PredictRLM(dspy.RLM):
             start_time_unix_nano=action_start_ns,
             end_time_unix_nano=action_start_ns,
         )
-        try:
-            lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
-            pred = self.generate_action(
-                variables_info=variables_info,
-                repl_history=history,
-                iteration=f"{iteration + 1}/{self.max_iterations}",
+        return action_start_ns, snapshot_lm_history_len(dspy.settings.lm)
+
+    def _action_kwargs(self, variables, history, iteration: int) -> dict[str, Any]:
+        """Inputs for the action predictor, shared by both call styles."""
+        return dict(
+            variables_info=[variable.format() for variable in variables],
+            repl_history=history,
+            iteration=f"{iteration + 1}/{self.max_iterations}",
+        )
+
+    @staticmethod
+    def _validate_action(pred: Any) -> None:
+        """Reject an adapter response the REPL loop can't act on."""
+        if not isinstance(getattr(pred, "reasoning", None), str):
+            raise RuntimeError(
+                "PredictRLM action adapter returned invalid reasoning; "
+                "expected a validated non-null string."
             )
-            if not isinstance(getattr(pred, "reasoning", None), str):
-                raise RuntimeError(
-                    "PredictRLM action adapter returned invalid reasoning; "
-                    "expected a validated non-null string."
-                )
-            if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
-                raise RuntimeError(
-                    "PredictRLM action adapter returned invalid code; "
-                    "expected a validated non-empty string."
-                )
-        except BaseException as exc:
-            lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
-            self._write_telemetry_span(
-                "rlm.action_generation.parse_error",
-                iteration=iteration + 1,
-                status=self._action_generation_error_status(exc),
-                attributes=self._action_generation_error_attrs(
-                    exc,
-                    lm_metadata=lm_metadata,
-                ),
-                start_time_unix_nano=action_start_ns,
+        if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
+            raise RuntimeError(
+                "PredictRLM action adapter returned invalid code; "
+                "expected a validated non-empty string."
             )
-            raise
-        lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
+
+    def _record_action_error(
+        self, exc: BaseException, iteration: int, action_start_ns: int, hist_before: int
+    ) -> None:
+        self._write_telemetry_span(
+            "rlm.action_generation.parse_error",
+            iteration=iteration + 1,
+            status=self._action_generation_error_status(exc),
+            attributes=self._action_generation_error_attrs(
+                exc,
+                lm_metadata=lm_completion_metadata_since(dspy.settings.lm, hist_before),
+            ),
+            start_time_unix_nano=action_start_ns,
+        )
+
+    def _record_action_ok(
+        self, pred: Any, iteration: int, action_start_ns: int, hist_before: int
+    ) -> Any:
+        """Close the action span and return the call's LM metadata."""
+        lm_metadata = lm_finish_since(dspy.settings.lm, hist_before)
         self._write_telemetry_span(
             "rlm.action_generation.ok",
             iteration=iteration + 1,
@@ -1939,6 +1981,15 @@ class PredictRLM(dspy.RLM):
                 "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
             },
         )
+        return lm_metadata
+
+    def _prepare_iteration_code(self, pred: Any, iteration: int) -> str:
+        """Extract the code to run and arm partial-trajectory capture.
+
+        Reasoning+code are captured BEFORE executing so a mid-execution
+        cancellation still leaves this iteration visible in the partial
+        trajectory (output will be empty / placeholder).
+        """
         if self.verbose:
             import logging as _logging
 
@@ -1947,8 +1998,7 @@ class PredictRLM(dspy.RLM):
                 f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
             )
 
-        code = pred.code or ""
-        code = _strip_code_fences(code)
+        code = _strip_code_fences(pred.code or "")
         self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
 
         from dspy.primitives.repl_types import REPLEntry
@@ -1959,14 +2009,17 @@ class PredictRLM(dspy.RLM):
             output="",
         )
         self._partial_pending_start = time.perf_counter()
+        return code
 
-        try:
-            result = repl.execute(code, variables=dict(input_args))
-        except SandboxFatalError:
-            raise
-        except (CodeInterpreterError, SyntaxError) as e:
-            result = _format_execution_error(code, e)
+    def _finish_iteration(
+        self, pred, code, result, history, output_field_names, lm_metadata
+    ):
+        """Fold an execution result into the REPL history and disarm capture.
 
+        step_result is either a new REPLHistory (iteration continues) or a
+        dspy.Prediction (SUBMIT happened). Only the former gets a history
+        snapshot, but both mean execution is no longer in flight.
+        """
         if _PARENT_TAKES_CODE:
             step_result = self._process_execution_result(
                 pred, code, result, history, output_field_names
@@ -1982,6 +2035,41 @@ class PredictRLM(dspy.RLM):
         self._last_action_lm_metadata = lm_metadata
         return step_result
 
+    def _execute_iteration(
+        self,
+        repl,
+        variables,
+        history,
+        iteration,
+        input_args,
+        output_field_names,
+    ):
+        """Execute one synchronous RLM iteration with PredictRLM validation."""
+        action_start_ns, hist_before = self._begin_action_generation(iteration)
+        try:
+            pred = self.generate_action(
+                **self._action_kwargs(variables, history, iteration)
+            )
+            self._validate_action(pred)
+        except BaseException as exc:
+            self._record_action_error(exc, iteration, action_start_ns, hist_before)
+            raise
+        lm_metadata = self._record_action_ok(
+            pred, iteration, action_start_ns, hist_before
+        )
+        code = self._prepare_iteration_code(pred, iteration)
+
+        try:
+            result = repl.execute(code, variables=dict(input_args))
+        except SandboxFatalError:
+            raise
+        except (CodeInterpreterError, SyntaxError) as e:
+            result = _format_execution_error(code, e)
+
+        return self._finish_iteration(
+            pred, code, result, history, output_field_names, lm_metadata
+        )
+
     async def _aexecute_iteration(
         self,
         repl,
@@ -1991,85 +2079,33 @@ class PredictRLM(dspy.RLM):
         input_args,
         output_field_names,
     ):
-        """Override parent to use non-blocking aexecute() on the interpreter.
+        """Async twin of :meth:`_execute_iteration`.
 
-        The parent calls repl.execute() synchronously which blocks the event
-        loop, serializing all concurrent rollouts. This override uses
-        repl.aexecute() (available on JspiInterpreter) so the event loop
-        stays free for other coroutines.
+        Two deliberate divergences from the sync path, which is why these
+        skeletons stay separate (everything else routes through the same
+        helpers):
+
+        - It prefers the interpreter's non-blocking ``aexecute()``. The
+          parent's ``repl.execute()`` blocks the event loop and serializes
+          every concurrent rollout; ``execute`` remains the fallback for
+          interpreters that don't implement the async face.
+        - It converts ANY non-fatal exception into a REPL error string, not
+          just ``CodeInterpreterError``/``SyntaxError``, since the async
+          transport surfaces a wider set of failures.
         """
-        variables_info = [variable.format() for variable in variables]
-        action_start_ns = time.time_ns()
-        self._write_telemetry_span(
-            "rlm.action_generation.start",
-            iteration=iteration + 1,
-            start_time_unix_nano=action_start_ns,
-            end_time_unix_nano=action_start_ns,
-        )
+        action_start_ns, hist_before = self._begin_action_generation(iteration)
         try:
-            lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
             pred = await self.generate_action.acall(
-                variables_info=variables_info,
-                repl_history=history,
-                iteration=f"{iteration + 1}/{self.max_iterations}",
+                **self._action_kwargs(variables, history, iteration)
             )
-            if not isinstance(getattr(pred, "reasoning", None), str):
-                raise RuntimeError(
-                    "PredictRLM action adapter returned invalid reasoning; "
-                    "expected a validated non-null string."
-                )
-            if not isinstance(getattr(pred, "code", None), str) or len(pred.code) < 1:
-                raise RuntimeError(
-                    "PredictRLM action adapter returned invalid code; "
-                    "expected a validated non-empty string."
-                )
+            self._validate_action(pred)
         except BaseException as exc:
-            lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
-            self._write_telemetry_span(
-                "rlm.action_generation.parse_error",
-                iteration=iteration + 1,
-                status=self._action_generation_error_status(exc),
-                attributes=self._action_generation_error_attrs(
-                    exc,
-                    lm_metadata=lm_metadata,
-                ),
-                start_time_unix_nano=action_start_ns,
-            )
+            self._record_action_error(exc, iteration, action_start_ns, hist_before)
             raise
-        lm_metadata = lm_finish_since(dspy.settings.lm, lm_hist_before_action)
-        self._write_telemetry_span(
-            "rlm.action_generation.ok",
-            iteration=iteration + 1,
-            start_time_unix_nano=action_start_ns,
-            attributes={
-                "has_code": True,
-                "code_chars": len(getattr(pred, "code", "") or ""),
-                "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
-            },
+        lm_metadata = self._record_action_ok(
+            pred, iteration, action_start_ns, hist_before
         )
-        if self.verbose:
-            import logging as _logging
-
-            _logging.getLogger("dspy.predict.rlm").info(
-                f"RLM iteration {iteration + 1}/{self.max_iterations}\n"
-                f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
-            )
-
-        code = pred.code or ""
-        code = _strip_code_fences(code)
-        self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
-
-        # Capture reasoning+code BEFORE executing so a mid-execution
-        # cancellation still leaves this iteration visible in the partial
-        # trajectory (output will be empty / placeholder).
-        from dspy.primitives.repl_types import REPLEntry
-
-        self._partial_pending_entry = REPLEntry(
-            reasoning=getattr(pred, "reasoning", "") or "",
-            code=code,
-            output="",
-        )
-        self._partial_pending_start = time.perf_counter()
+        code = self._prepare_iteration_code(pred, iteration)
 
         try:
             if hasattr(repl, "aexecute"):
@@ -2081,24 +2117,9 @@ class PredictRLM(dspy.RLM):
         except Exception as e:
             result = _format_execution_error(code, e)
 
-        if _PARENT_TAKES_CODE:
-            step_result = self._process_execution_result(
-                pred, code, result, history, output_field_names
-            )
-        else:
-            step_result = self._process_execution_result(
-                pred, result, history, output_field_names
-            )
-        # Snapshot the updated REPL history for partial-trajectory recovery.
-        # step_result is either a new REPLHistory (iteration continues) or a
-        # dspy.Prediction (SUBMIT happened). Only the former gets a history
-        # snapshot, but both mean execution is no longer in flight.
-        if not isinstance(step_result, dspy.Prediction):
-            self._partial_history = step_result
-        self._partial_pending_entry = None
-        self._partial_pending_start = None
-        self._last_action_lm_metadata = lm_metadata
-        return step_result
+        return self._finish_iteration(
+            pred, code, result, history, output_field_names, lm_metadata
+        )
 
     def _prepare_file_io(
         self, input_args: dict[str, Any]
@@ -2300,22 +2321,19 @@ class PredictRLM(dspy.RLM):
             isinstance(result, dspy.Prediction),
         )
 
-    def _run_extract_fallback(
-        self,
-        variables: list[Any],
-        history: Any,
-        output_field_names: list[str],
-        state: "_ExtractFallbackState",
-    ) -> dspy.Prediction:
-        """Meter + bound the sync max-iterations extract fallback.
+    def _meter_extract_fallback(self, state: "_ExtractFallbackState") -> bool:
+        """Charge one max-iterations extract fallback against the run budget.
 
         ``_extract_fallback`` (inherited from dspy) makes ONE dspy.Predict call
         on the MAIN LM that ``max_llm_calls`` cannot see. Track it on the
         per-forward ``state`` (local to this invocation — never instance state,
         so concurrent forwards don't race) and gate it behind that run's budget
         (default 1) so the metering is visible per run without silently
-        degrading reused instances. When the per-forward budget is exhausted,
-        skip the LM call and return the degraded outcome.
+        degrading reused instances.
+
+        Returns True when the caller may make the LM call, False when the
+        budget is exhausted and the degraded outcome should be returned
+        instead. Emits the matching telemetry span either way.
         """
         start_ns = time.time_ns()
         if state.count >= state.bound:
@@ -2324,9 +2342,7 @@ class PredictRLM(dspy.RLM):
                 attributes=self._extract_fallback_attrs(state),
                 start_time_unix_nano=start_ns,
             )
-            return self._extract_fallback_skipped(
-                variables, history, output_field_names
-            )
+            return False
         state.count += 1
         self._extract_fallback_count += 1  # lifetime total (atomic under asyncio)
         self._write_telemetry_span(
@@ -2334,6 +2350,20 @@ class PredictRLM(dspy.RLM):
             attributes=self._extract_fallback_attrs(state),
             start_time_unix_nano=start_ns,
         )
+        return True
+
+    def _run_extract_fallback(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+        state: "_ExtractFallbackState",
+    ) -> dspy.Prediction:
+        """Metered + bounded sync max-iterations extract fallback."""
+        if not self._meter_extract_fallback(state):
+            return self._extract_fallback_skipped(
+                variables, history, output_field_names
+            )
         return self._extract_fallback(variables, history, output_field_names)
 
     async def _arun_extract_fallback(
@@ -2344,23 +2374,10 @@ class PredictRLM(dspy.RLM):
         state: "_ExtractFallbackState",
     ) -> dspy.Prediction:
         """Async twin of :meth:`_run_extract_fallback`."""
-        start_ns = time.time_ns()
-        if state.count >= state.bound:
-            self._write_telemetry_span(
-                "rlm.extract_fallback.skipped",
-                attributes=self._extract_fallback_attrs(state),
-                start_time_unix_nano=start_ns,
-            )
+        if not self._meter_extract_fallback(state):
             return self._extract_fallback_skipped(
                 variables, history, output_field_names
             )
-        state.count += 1
-        self._extract_fallback_count += 1  # lifetime total (atomic under asyncio)
-        self._write_telemetry_span(
-            "rlm.extract_fallback.ok",
-            attributes=self._extract_fallback_attrs(state),
-            start_time_unix_nano=start_ns,
-        )
         return await self._aextract_fallback(variables, history, output_field_names)
 
     def _extract_fallback_attrs(self, state: "_ExtractFallbackState") -> dict[str, Any]:
@@ -2398,14 +2415,20 @@ class PredictRLM(dspy.RLM):
             **outputs,
         )
 
-    def _forward_traced(
-        self,
-        file_plan: dict[str, Any] | None,
-        *,
-        fb_bound: int | None = None,
-        **input_args: Any,
-    ) -> dspy.Prediction:
-        """Execute forward() with tracing and optional file I/O."""
+    def _begin_traced_run(
+        self, file_plan: dict[str, Any] | None, fb_bound: int | None
+    ) -> _TracedRun:
+        """Set up per-run state shared by ``forward()`` and ``aforward()``.
+
+        Swaps in file-aware signatures when there's a file plan (restored by
+        :meth:`_end_traced_run`), starts the run clock, and snapshots LM
+        history lengths so ``usage_since`` can take the delta at the end.
+        Per-RLM ``lm.copy()`` in ``__init__`` means each instance has its OWN
+        history, so concurrent runs don't cross-contaminate; DSPy's BaseLM
+        populates ``entry["cost"]`` from ``_hidden_params["response_cost"]``,
+        so ``usage_since`` returns LiteLLM-computed authoritative cost. No
+        ``track_usage`` context is needed.
+        """
         _, output_file_fields = scan_file_fields(self.signature) if file_plan else (None, {})
 
         orig_action, orig_extract = self.generate_action, self.extract
@@ -2416,54 +2439,148 @@ class PredictRLM(dspy.RLM):
 
         run_start = time.perf_counter()
         self._run_start = run_start  # anchor for _phase_log elapsed timings
-        # Per-forward extract-fallback metering — LOCAL state so concurrent
-        # forwards on this instance don't race on a shared counter/budget.
-        fb_state = _ExtractFallbackState(
-            bound=self.max_extract_fallbacks if fb_bound is None else fb_bound
-        )
         lm = dspy.settings.lm
         sub_lm = self._sub_lm
-        # Per-RLM instance ``lm`` has its own history (via ``lm.copy()``
-        # in ``__init__``) so these snapshots are isolated from other
-        # concurrent PredictRLM runs. No track_usage context needed —
-        # DSPy's BaseLM stamps cost and tokens into history on every call.
-        lm_hist_start = snapshot_lm_history_len(lm)
-        sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
-        steps: list[IterationStep] = []
+        run = _TracedRun(
+            file_plan=file_plan,
+            output_file_fields=output_file_fields,
+            orig_action=orig_action,
+            orig_extract=orig_extract,
+            run_start=run_start,
+            # Per-forward extract-fallback metering — LOCAL state so concurrent
+            # (a)forwards on this instance don't race on a shared counter/budget.
+            fb_state=_ExtractFallbackState(
+                bound=self.max_extract_fallbacks if fb_bound is None else fb_bound
+            ),
+            lm=lm,
+            sub_lm=sub_lm,
+            lm_hist_start=snapshot_lm_history_len(lm),
+            sub_hist_start=(
+                snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
+            ),
+        )
         self._begin_telemetry_execution()
+        return run
 
+    def _end_traced_run(self, run: _TracedRun) -> None:
+        """Tear down what :meth:`_begin_traced_run` established."""
+        self._clear_telemetry_execution()
+        if run.file_plan:
+            self.generate_action, self.extract = run.orig_action, run.orig_extract
+
+    def _prepare_traced_execution(
+        self, run: _TracedRun, input_args: dict[str, Any]
+    ) -> tuple[list[str], list[Any], dict[str, Any]]:
+        """Validate inputs and build everything the REPL loop needs."""
+        self._validate_inputs(input_args)
+        output_field_names = list(self.signature.output_fields.keys())
+        execution_tools = self._prepare_execution_tools()
+        variables = self._build_variables(**input_args)
+        ctx_kwargs = (
+            dict(execution_tools=execution_tools, file_plan=run.file_plan)
+            if run.file_plan
+            else dict(execution_tools=execution_tools)
+        )
+        return output_field_names, variables, ctx_kwargs
+
+    def _begin_iteration_loop(self, run: _TracedRun, repl: Any) -> tuple[Any, str | None]:
+        """Mount sandbox files and reset partial-trajectory capture.
+
+        The reset is per-(a)forward so crash-recovery consumers (see e.g. the
+        spreadbench optimizer's ``_recover_partial_trace``) read the last
+        committed REPL state of THIS run if an iteration hangs or errors.
+        """
+        if run.file_plan:
+            self._setup_sandbox_files(repl, run.file_plan)
+
+        from dspy.primitives.repl_types import REPLHistory
+
+        history = REPLHistory()
+        self._partial_history = history
+        self._partial_pending_entry = None
+        self._partial_pending_start = None
+        return history, ACTIVE_CALL_ID.get()
+
+    @contextmanager
+    def _call_collector_scope(self) -> Iterator[None]:
+        """Collect predict/tool calls for the duration of one REPL loop."""
+        predict_token = init_predict_call_collector()
+        tool_token = init_tool_call_collector()
         try:
-            self._validate_inputs(input_args)
-            output_field_names = list(self.signature.output_fields.keys())
-            execution_tools = self._prepare_execution_tools()
-            variables = self._build_variables(**input_args)
+            yield
+        finally:
+            reset_tool_call_collector(tool_token)
+            reset_predict_call_collector(predict_token)
 
-            ctx_kwargs = (
-                dict(execution_tools=execution_tools, file_plan=file_plan)
-                if file_plan
-                else dict(execution_tools=execution_tools)
+    def _record_iteration_outcome(
+        self,
+        run: _TracedRun,
+        state: _IterationCallbackState,
+        result: Any,
+        history: Any,
+        iteration: int,
+        iter_start: float,
+    ) -> None:
+        """Turn one iteration's result into a trace step on ``run``."""
+        action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
+        self._last_action_lm_metadata = None
+        state.step, state.is_final = self._build_iteration_outcome(
+            result, history, iteration, iter_start, action_lm_metadata
+        )
+        run.steps.append(state.step)
+
+    def _finish_traced_run(
+        self, prediction: dspy.Prediction, run: _TracedRun, status: str, repl: Any
+    ) -> dspy.Prediction:
+        """Sync output files and attach the run trace to the prediction."""
+        if run.output_file_fields:
+            self._sync_output_files(
+                repl, prediction, run.output_file_fields, run.file_plan
+            )
+        prediction.trace = self._run_trace(run, status)
+        return prediction
+
+    def _attach_error_trace(self, exc: BaseException, run: _TracedRun) -> None:
+        """Best-effort trace on a failed run — never mask the original error."""
+        try:
+            exc.trace = self._run_trace(run, "error")
+        except Exception:
+            pass
+
+    def _run_trace(self, run: _TracedRun, status: str) -> Any:
+        return self._build_run_trace(
+            status=status,
+            steps=run.steps,
+            lm=run.lm,
+            sub_lm=run.sub_lm,
+            lm_hist_start=run.lm_hist_start,
+            sub_hist_start=run.sub_hist_start,
+            run_start=run.run_start,
+            extract_fallbacks=run.fb_state.count,
+        )
+
+    def _forward_traced(
+        self,
+        file_plan: dict[str, Any] | None,
+        *,
+        fb_bound: int | None = None,
+        **input_args: Any,
+    ) -> dspy.Prediction:
+        """Execute forward() with tracing and optional file I/O.
+
+        The await-bearing loop skeleton is the only thing that differs from
+        :meth:`_aforward_traced`; every other line is a call into a helper
+        the two share. Keep it that way — see tests/test_sync_async_parity.py.
+        """
+        run = self._begin_traced_run(file_plan, fb_bound)
+        try:
+            output_field_names, variables, ctx_kwargs = self._prepare_traced_execution(
+                run, input_args
             )
             with self._interpreter_context(**ctx_kwargs) as repl:
-                if file_plan:
-                    self._setup_sandbox_files(repl, file_plan)
-
-                from dspy.primitives.repl_types import REPLHistory
-
-                predict_token = init_predict_call_collector()
-                tool_token = init_tool_call_collector()
-
-                try:
+                history, call_id = self._begin_iteration_loop(run, repl)
+                with self._call_collector_scope():
                     status = "max_iterations"
-                    history = REPLHistory()
-                    # Reset partial-trajectory capture for this forward() call
-                    # so crash-recovery consumers (see e.g. the spreadbench
-                    # optimizer's _recover_partial_trace) can read the last
-                    # committed REPL state if an iteration hangs or errors.
-                    self._partial_history = history
-                    self._partial_pending_entry = None
-                    self._partial_pending_start = None
-                    call_id = ACTIVE_CALL_ID.get()
-
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
                         with self._iteration_callback_scope(call_id, iteration) as state:
@@ -2475,68 +2592,26 @@ class PredictRLM(dspy.RLM):
                                 input_args,
                                 output_field_names,
                             )
-                            action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
-                            self._last_action_lm_metadata = None
-                            state.step, state.is_final = self._build_iteration_outcome(
-                                result,
-                                history,
-                                iteration,
-                                iter_start,
-                                action_lm_metadata,
+                            self._record_iteration_outcome(
+                                run, state, result, history, iteration, iter_start
                             )
-                            steps.append(state.step)
 
                         if state.is_final:
                             status = "completed"
                             prediction = result
-                            if output_file_fields:
-                                self._sync_output_files(
-                                    repl, prediction, output_file_fields, file_plan
-                                )
                             break
                         history = result
                     else:
                         prediction = self._run_extract_fallback(
-                            variables, history, output_field_names, fb_state
+                            variables, history, output_field_names, run.fb_state
                         )
-                        if output_file_fields:
-                            self._sync_output_files(
-                                repl, prediction, output_file_fields, file_plan
-                            )
 
-                    prediction.trace = self._build_run_trace(
-                        status=status,
-                        steps=steps,
-                        lm=lm,
-                        sub_lm=sub_lm,
-                        lm_hist_start=lm_hist_start,
-                        sub_hist_start=sub_hist_start,
-                        run_start=run_start,
-                        extract_fallbacks=fb_state.count,
-                    )
-                    return prediction
-                finally:
-                    reset_tool_call_collector(tool_token)
-                    reset_predict_call_collector(predict_token)
+                    return self._finish_traced_run(prediction, run, status, repl)
         except BaseException as exc:
-            try:
-                exc.trace = self._build_run_trace(
-                    status="error",
-                    steps=steps,
-                    lm=lm,
-                    sub_lm=sub_lm,
-                    lm_hist_start=lm_hist_start,
-                    sub_hist_start=sub_hist_start,
-                    run_start=run_start,
-                    extract_fallbacks=fb_state.count,
-                )
-            except Exception:
-                pass
+            self._attach_error_trace(exc, run)
             raise
         finally:
-            self._clear_telemetry_execution()
-            if file_plan:
-                self.generate_action, self.extract = orig_action, orig_extract
+            self._end_traced_run(run)
 
     async def _aforward_traced(
         self,
@@ -2545,67 +2620,19 @@ class PredictRLM(dspy.RLM):
         fb_bound: int | None = None,
         **input_args: Any,
     ) -> dspy.Prediction:
-        """Execute aforward() with tracing and optional file I/O."""
-        _, output_file_fields = scan_file_fields(self.signature) if file_plan else (None, {})
+        """Execute aforward() with tracing and optional file I/O.
 
-        orig_action, orig_extract = self.generate_action, self.extract
-        if file_plan:
-            self.generate_action, self.extract = self._build_signatures_with_files(
-                file_plan["instructions"]
-            )
-
-        run_start = time.perf_counter()
-        self._run_start = run_start  # anchor for _phase_log elapsed timings
-        # Per-forward extract-fallback metering — LOCAL state so concurrent
-        # aforwards on this instance don't race on a shared counter/budget.
-        fb_state = _ExtractFallbackState(
-            bound=self.max_extract_fallbacks if fb_bound is None else fb_bound
-        )
-        lm = dspy.settings.lm
-        sub_lm = self._sub_lm
-        # Snapshot lm.history lengths at run start so ``usage_since`` can
-        # sum the delta at end. Per-RLM ``lm.copy()`` in __init__ means
-        # each PredictRLM instance has its OWN history — concurrent runs
-        # don't cross-contaminate. DSPy's BaseLM populates
-        # ``entry["cost"]`` from ``_hidden_params["response_cost"]``, so
-        # ``usage_since`` returns LiteLLM-computed authoritative cost.
-        lm_hist_start = snapshot_lm_history_len(lm)
-        sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
-        steps: list[IterationStep] = []
-        self._begin_telemetry_execution()
-
+        Async twin of :meth:`_forward_traced` — identical modulo await.
+        """
+        run = self._begin_traced_run(file_plan, fb_bound)
         try:
-            self._validate_inputs(input_args)
-            output_field_names = list(self.signature.output_fields.keys())
-            execution_tools = self._prepare_execution_tools()
-            variables = self._build_variables(**input_args)
-
-            ctx_kwargs = (
-                dict(execution_tools=execution_tools, file_plan=file_plan)
-                if file_plan
-                else dict(execution_tools=execution_tools)
+            output_field_names, variables, ctx_kwargs = self._prepare_traced_execution(
+                run, input_args
             )
             with self._interpreter_context(**ctx_kwargs) as repl:
-                if file_plan:
-                    self._setup_sandbox_files(repl, file_plan)
-
-                from dspy.primitives.repl_types import REPLHistory
-
-                predict_token = init_predict_call_collector()
-                tool_token = init_tool_call_collector()
-
-                try:
+                history, call_id = self._begin_iteration_loop(run, repl)
+                with self._call_collector_scope():
                     status = "max_iterations"
-                    history = REPLHistory()
-                    # Reset partial-trajectory capture for this aforward() call
-                    # so crash-recovery consumers (see e.g. the spreadbench
-                    # optimizer's _recover_partial_trace) can read the last
-                    # committed REPL state if an iteration hangs or errors.
-                    self._partial_history = history
-                    self._partial_pending_entry = None
-                    self._partial_pending_start = None
-                    call_id = ACTIVE_CALL_ID.get()
-
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
                         async with self._aiteration_callback_scope(call_id, iteration) as state:
@@ -2617,68 +2644,26 @@ class PredictRLM(dspy.RLM):
                                 input_args,
                                 output_field_names,
                             )
-                            action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
-                            self._last_action_lm_metadata = None
-                            state.step, state.is_final = self._build_iteration_outcome(
-                                result,
-                                history,
-                                iteration,
-                                iter_start,
-                                action_lm_metadata,
+                            self._record_iteration_outcome(
+                                run, state, result, history, iteration, iter_start
                             )
-                            steps.append(state.step)
 
                         if state.is_final:
                             status = "completed"
                             prediction = result
-                            if output_file_fields:
-                                self._sync_output_files(
-                                    repl, prediction, output_file_fields, file_plan
-                                )
                             break
                         history = result
                     else:
                         prediction = await self._arun_extract_fallback(
-                            variables, history, output_field_names, fb_state
+                            variables, history, output_field_names, run.fb_state
                         )
-                        if output_file_fields:
-                            self._sync_output_files(
-                                repl, prediction, output_file_fields, file_plan
-                            )
 
-                    prediction.trace = self._build_run_trace(
-                        status=status,
-                        steps=steps,
-                        lm=lm,
-                        sub_lm=sub_lm,
-                        lm_hist_start=lm_hist_start,
-                        sub_hist_start=sub_hist_start,
-                        run_start=run_start,
-                        extract_fallbacks=fb_state.count,
-                    )
-                    return prediction
-                finally:
-                    reset_tool_call_collector(tool_token)
-                    reset_predict_call_collector(predict_token)
+                    return self._finish_traced_run(prediction, run, status, repl)
         except BaseException as exc:
-            try:
-                exc.trace = self._build_run_trace(
-                    status="error",
-                    steps=steps,
-                    lm=lm,
-                    sub_lm=sub_lm,
-                    lm_hist_start=lm_hist_start,
-                    sub_hist_start=sub_hist_start,
-                    run_start=run_start,
-                    extract_fallbacks=fb_state.count,
-                )
-            except Exception:
-                pass
+            self._attach_error_trace(exc, run)
             raise
         finally:
-            self._clear_telemetry_execution()
-            if file_plan:
-                self.generate_action, self.extract = orig_action, orig_extract
+            self._end_traced_run(run)
 
     def _build_signatures_with_files(
         self, file_instructions: str
