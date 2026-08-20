@@ -1,9 +1,9 @@
-"""Tests for the SbxInterpreter ``docker`` and ``host`` runtimes.
+"""Tests for the SbxBackend ``docker`` and ``host`` runtimes.
 
 These runtimes share the ``sbx`` backend's filesystem-staged file model and
-stdio JSON-RPC protocol; they only change how the ``python_runner`` process is
+stdio JSON-RPC protocol; they only change how the supervisor process is
 launched. The unit tests assert the launch argv without touching Docker; the
-host smoke test exercises the full runner round-trip with the test interpreter;
+host smoke test exercises the full supervisor round-trip with the test backend;
 the Docker test is skipped unless a daemon is reachable.
 """
 
@@ -16,22 +16,14 @@ from pathlib import Path
 
 import pytest
 
-# The docker/host runtimes lived on the legacy SbxInterpreter, which upstream
-# replaced with predict_rlm.backends.sbx. These tests are kept as the spec for
-# porting the runtimes onto the new backend; they skip until that port lands.
-pytest.importorskip(
-    "predict_rlm.interpreters",
-    reason="docker/host SBX runtimes pending port to predict_rlm.backends.sbx",
-)
-
-from predict_rlm.interpreter import SandboxFatalError  # noqa: E402
-from predict_rlm.interpreters import SbxConfig, SbxInterpreter  # noqa: E402
+from predict_rlm.backends import SbxBackend, SbxConfig
+from predict_rlm.backends.base import SandboxFatalError
 
 
-def _host_interpreter(tmp_path: Path) -> SbxInterpreter:
+def _host_interpreter(tmp_path: Path) -> SbxBackend:
     # Use the running interpreter as ``python3`` so the smoke test does not
     # depend on a system python3 being present / matching.
-    return SbxInterpreter(
+    return SbxBackend(
         config=SbxConfig(runtime="host", python_executable=sys.executable),
         preinstall_packages=False,
         _staging_root=tmp_path / "staging",
@@ -40,7 +32,7 @@ def _host_interpreter(tmp_path: Path) -> SbxInterpreter:
 
 class TestRuntimeCommandBuilding:
     def test_host_command_argv_and_dirs(self, tmp_path: Path):
-        itp = SbxInterpreter(
+        itp = SbxBackend(
             config=SbxConfig(runtime="host", python_executable="/usr/bin/python3"),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",
@@ -48,14 +40,14 @@ class TestRuntimeCommandBuilding:
         cmd = itp._build_host_runner_command()
         assert cmd[0] == "/usr/bin/python3"
         assert cmd[1] == "-u"
-        assert cmd[2].endswith("python_runner.py")
-        # runner is staged and the sandbox workdir is pre-created
+        assert cmd[2].endswith("_payload.py")
+        # supervisor is staged and the sandbox workdir is pre-created
         assert Path(cmd[2]).is_file()
         assert (itp._staging_root / "sandbox").is_dir()
 
     def test_host_sandbox_root_must_be_literal_sandbox(self, tmp_path: Path):
         with pytest.raises(SandboxFatalError, match="literal /sandbox"):
-            SbxInterpreter(
+            SbxBackend(
                 config=SbxConfig(
                     runtime="host",
                     python_executable="/usr/bin/python3",
@@ -66,7 +58,7 @@ class TestRuntimeCommandBuilding:
             )
 
     def test_docker_command_argv(self, tmp_path: Path):
-        itp = SbxInterpreter(
+        itp = SbxBackend(
             config=SbxConfig(
                 runtime="docker",
                 image="example/img:latest",
@@ -100,10 +92,10 @@ class TestRuntimeCommandBuilding:
             "-u",
             cmd[-1],
         ]
-        assert cmd[-1].endswith("python_runner.py")
+        assert cmd[-1].endswith("_payload.py")
 
     def test_docker_requires_image(self, tmp_path: Path):
-        itp = SbxInterpreter(
+        itp = SbxBackend(
             config=SbxConfig(runtime="docker", image=None),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",
@@ -113,9 +105,9 @@ class TestRuntimeCommandBuilding:
 
     def test_docker_requires_cli(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(
-            "predict_rlm.interpreters.sbx.shutil.which", lambda name: None
+            "predict_rlm.backends.sbx.backend.shutil.which", lambda name: None
         )
-        itp = SbxInterpreter(
+        itp = SbxBackend(
             config=SbxConfig(runtime="docker", image="example/img:latest"),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",
@@ -126,7 +118,7 @@ class TestRuntimeCommandBuilding:
     def test_staging_root_base_is_honored(self, tmp_path: Path):
         base = tmp_path / "shareable"
         base.mkdir()
-        itp = SbxInterpreter(
+        itp = SbxBackend(
             config=SbxConfig(runtime="host", staging_root_base=str(base)),
             preinstall_packages=False,
         )
@@ -163,7 +155,7 @@ class TestHostRuntimeSmoke:
         reason="requires an opt-in writable /sandbox owned by this test run",
     )
     def test_external_sandbox_root_supports_literal_stdlib_paths(self, tmp_path: Path):
-        itp = SbxInterpreter(
+        itp = SbxBackend(
             config=SbxConfig(
                 runtime="host",
                 python_executable=sys.executable,
@@ -202,8 +194,8 @@ class TestHostRuntimeSmoke:
 class TestDockerRuntimeIntegration:
     IMAGE = os.environ.get("PREDICT_RLM_TEST_DOCKER_IMAGE", "python:3.12-slim")
 
-    def _interpreter(self, tmp_path: Path) -> SbxInterpreter:
-        return SbxInterpreter(
+    def _interpreter(self, tmp_path: Path) -> SbxBackend:
+        return SbxBackend(
             config=SbxConfig(runtime="docker", image=self.IMAGE, docker_network="none"),
             preinstall_packages=False,
             _staging_root=tmp_path / "staging",

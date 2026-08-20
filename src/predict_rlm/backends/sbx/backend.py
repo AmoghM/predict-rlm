@@ -165,7 +165,11 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
         self._direct_workspace_mounts = list(direct_workspace_mounts or [])
         self.runtime_hooks = list(runtime_hooks or [])
         self.on_runtime_hook_event = on_runtime_hook_event
-        self._host_workspace = Path.cwd()
+        self._host_workspace = (
+            Path(self.config.staging_root_base)
+            if self.config.staging_root_base
+            else Path.cwd()
+        )
         self._owns_staging_root = _staging_root is None
         if _staging_root is not None:
             self._staging_root = Path(_staging_root)
@@ -180,6 +184,16 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
         self._staging_root.mkdir(parents=True, exist_ok=True)
         if self._owns_staging_root and not self.config.persist:
             _owned_staging_roots_pending_cleanup.add(str(self._staging_root))
+        # Host-runtime external sandbox root: validated (and wiped) up front so
+        # a misconfigured path fails at construction, not mid-run.
+        self._host_sandbox_root = (
+            Path(self.config.host_sandbox_root).resolve()
+            if self.config.runtime == "host" and self.config.host_sandbox_root
+            else None
+        )
+        if self._host_sandbox_root is not None:
+            self._reset_sandbox_root()
+        self._container_name: str | None = None
         self._proc: subprocess.Popen[str] | None = None
         self._stdout_lines: queue.Queue[str] = queue.Queue()
         self._stdout_reader: threading.Thread | None = None
@@ -236,7 +250,9 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
         )
 
     def _uses_websocket_transport(self) -> bool:
-        return self._supervisor_command is None
+        # The docker/host runtimes speak stdio JSON-RPC to the supervisor they
+        # launch; only the ``sbx`` CLI runtime uses the websocket supervisor.
+        return self._supervisor_command is None and self.config.runtime == "sbx"
 
     def _transport_running(self) -> bool:
         if self._uses_websocket_transport():
@@ -855,9 +871,8 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
             raise RuntimeError("Cannot reset SBX while host tool work is still active")
         self._log_lifecycle("sbx.reset.start")
         self._send_request("reset", {})
-        sandbox_root = self._staging_root / "sandbox"
-        shutil.rmtree(sandbox_root, ignore_errors=True)
-        sandbox_root.mkdir(parents=True, exist_ok=True)
+        self._reset_sandbox_root()
+        self._link_external_host_sandbox_root()
         self._post_execute_hooks.clear()
         self._log_lifecycle("sbx.reset.ok")
 
@@ -866,9 +881,8 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
             raise RuntimeError("Cannot reset SBX while host tool work is still active")
         self._log_lifecycle("sbx.reset.start")
         await self._asend_websocket_request("reset", {})
-        sandbox_root = self._staging_root / "sandbox"
-        shutil.rmtree(sandbox_root, ignore_errors=True)
-        sandbox_root.mkdir(parents=True, exist_ok=True)
+        self._reset_sandbox_root()
+        self._link_external_host_sandbox_root()
         self._post_execute_hooks.clear()
         self._log_lifecycle("sbx.reset.ok")
 
@@ -951,9 +965,35 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
                 text=True,
             )
             self._log_lifecycle("sbx.shutdown.stop")
+        self._reap_docker_container()
+        if self._host_sandbox_root is not None and not self.config.persist:
+            self._reset_sandbox_root()
         self._cleanup_direct_workspace_aliases_host_side()
         self._cleanup_staging_root()
         self._log_lifecycle("sbx.shutdown.complete")
+
+    def _reap_docker_container(self) -> None:
+        """Force-remove the docker-runtime container on shutdown.
+
+        ``--rm`` removes the container on normal exit; this covers the
+        graceful-shutdown path and is a no-op if already gone. A SIGKILLed
+        parent orphans the ``docker run`` client, so callers that hard-kill
+        must reap by container name themselves.
+        """
+        if (
+            self._supervisor_command is None
+            and self.config.runtime == "docker"
+            and self._container_name
+            and self.config.remove_on_shutdown
+            and not self.config.persist
+        ):
+            subprocess.run(
+                ["docker", "rm", "-f", self._container_name],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            self._log_lifecycle("sbx.shutdown.docker_rm")
 
     def _shutdown_async_transport_after_loop_closed(self) -> None:
         if self._async_ws is not None:
@@ -1007,6 +1047,9 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
                 check=False,
             )
             self._log_lifecycle("sbx.shutdown.stop")
+        self._reap_docker_container()
+        if self._host_sandbox_root is not None and not self.config.persist:
+            self._reset_sandbox_root()
         self._cleanup_direct_workspace_aliases_host_side()
         self._cleanup_staging_root()
         self._async_loop = None
@@ -1090,6 +1133,10 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
             if self._supervisor_command is not None:
                 self._setup_direct_workspace_aliases_host_side()
                 command = self._supervisor_command
+            elif self.config.runtime == "host":
+                command = self._build_host_runner_command()
+            elif self.config.runtime == "docker":
+                command = self._build_docker_runner_command()
             else:
                 command = self._start_sbx_and_build_supervisor_command()
             env = os.environ.copy()
@@ -1966,6 +2013,142 @@ class SbxBackend(SyncWorkerTracker, SupervisorClient, LegacyExecutionBackend):
         shutil.copy2(SUPERVISOR_PAYLOAD_SOURCE_PATH, supervisor_path)
         self._prepared_supervisor_path = supervisor_path
         return supervisor_path
+
+    def _build_host_runner_command(self) -> list[str]:
+        """Launch the supervisor as a bare host ``python3`` subprocess.
+
+        No container/isolation. The host ``PREDICT_RLM_SBX_ROOT`` env set in
+        ``_ensure_process`` makes the supervisor resolve the same staging root,
+        and host-side mount/sync already share that filesystem directly.
+
+        By default, literal ``/sandbox/...`` paths still depend on the
+        supervisor-patched ``open``/``pathlib`` shims. When ``host_sandbox_root``
+        is set, this runtime treats that directory as the real sandbox root and
+        symlinks the staging dir's ``sandbox`` child to it. That makes unpatched
+        stdlib calls such as ``os.replace`` and ``zipfile`` on literal
+        ``/sandbox/...`` paths land where host sync expects, as long as the host
+        process really has the same directory mounted at ``/sandbox``.
+        """
+        supervisor_path = self._prepare_supervisor_script()
+        self._link_external_host_sandbox_root()
+        return [self.config.python_executable, "-u", str(supervisor_path)]
+
+    def _build_docker_runner_command(self) -> list[str]:
+        """Launch the supervisor inside a plain ``docker run -i`` container.
+
+        The staging root is bind-mounted at its *resolved* host path (and
+        ``PREDICT_RLM_SBX_ROOT`` / ``-w`` use the same), so the absolute paths
+        baked into executed code by ``_map_variable_value`` — which resolves
+        symlinks (e.g. macOS ``/var`` -> ``/private/var``) — match the paths
+        that exist inside the container. Host-side tools (predict, recalc, ...)
+        ride the stdio JSON-RPC pipe, so the container needs no network by
+        default.
+        """
+        if not self.config.image:
+            raise SandboxFatalError(
+                "Docker runtime requires SbxConfig.image (the prebaked supervisor image)."
+            )
+        if shutil.which("docker") is None:
+            raise SandboxFatalError(
+                "Docker runtime requires the `docker` CLI on PATH and a running daemon."
+            )
+
+        supervisor_path = self._prepare_supervisor_script()
+        # ``-w`` is resolved at container start, before the supervisor's own mkdir.
+        (self._staging_root / "sandbox").mkdir(parents=True, exist_ok=True)
+
+        self._container_name = self.config.name or f"predict-rlm-{uuid.uuid4().hex}"
+        # Use the canonical (symlink-resolved) path on both sides of the bind
+        # mount so it matches the resolved paths in injected code; the container
+        # has no host-side symlinks (e.g. /private/var on macOS).
+        staging = str(self._staging_root.resolve())
+        supervisor_in_container = str(supervisor_path.resolve())
+        return [
+            "docker",
+            "run",
+            "-i",
+            "--rm",
+            "--name",
+            self._container_name,
+            "--network",
+            self.config.docker_network,
+            # 1) Stage the supervisor + injected (resolved) host paths at their
+            #    own absolute path so input-file variables resolve inside the
+            #    container.
+            "-v",
+            f"{staging}:{staging}",
+            # 2) Mount the sandbox dir at a REAL ``/sandbox`` so the full stdlib
+            #    (os.*, shutil, zipfile, openpyxl, pandas) operates on
+            #    ``/sandbox/...`` natively — matching Pyodide's MEMFS. Without
+            #    this, only ``open``/``pathlib`` (which the supervisor patches)
+            #    reach the staging dir; ``os.path.exists``/``shutil.copy2``/etc.
+            #    hit the container's empty root and silently mislead agent code.
+            "-v",
+            f"{staging}/sandbox:/sandbox",
+            "-w",
+            "/sandbox",
+            "-e",
+            f"PREDICT_RLM_SBX_ROOT={staging}",
+            *self.config.docker_extra_args,
+            self.config.image,
+            self.config.python_executable,
+            "-u",
+            supervisor_in_container,
+        ]
+
+    def _sandbox_root(self) -> Path:
+        if self._host_sandbox_root is not None:
+            return self._host_sandbox_root
+        return (self._staging_root / "sandbox").resolve()
+
+    def _validate_external_sandbox_root(self, sandbox_root: Path) -> None:
+        resolved = sandbox_root.resolve()
+        if resolved.parent == resolved:
+            raise SandboxFatalError("host_sandbox_root cannot be the filesystem root")
+        literal_sandbox = Path("/sandbox").resolve()
+        if resolved != literal_sandbox:
+            raise SandboxFatalError(
+                "host_sandbox_root must resolve to literal /sandbox. "
+                "Other paths do not catch unpatched stdlib writes to "
+                "/sandbox/... and would silently re-open the host-runtime "
+                "output sync bug."
+            )
+
+    def _reset_sandbox_root(self) -> None:
+        sandbox_root = self._sandbox_root()
+        if self._host_sandbox_root is None:
+            shutil.rmtree(sandbox_root, ignore_errors=True)
+            sandbox_root.mkdir(parents=True, exist_ok=True)
+            return
+
+        self._validate_external_sandbox_root(sandbox_root)
+        sandbox_root.mkdir(parents=True, exist_ok=True)
+        # This wipes a process-wide real /sandbox. Only use this mode when the
+        # hosting service guarantees one request/job per process or container
+        # (for example Cloud Run concurrency=1); otherwise concurrent jobs will
+        # corrupt each other's in-flight outputs.
+        for child in sandbox_root.iterdir():
+            if child.is_dir() and not child.is_symlink():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+
+    def _link_external_host_sandbox_root(self) -> None:
+        if self._host_sandbox_root is None:
+            (self._staging_root / "sandbox").mkdir(parents=True, exist_ok=True)
+            return
+
+        sandbox_root = self._sandbox_root()
+        self._validate_external_sandbox_root(sandbox_root)
+        sandbox_root.mkdir(parents=True, exist_ok=True)
+        staging_sandbox = self._staging_root / "sandbox"
+        if staging_sandbox.is_symlink():
+            if staging_sandbox.resolve() == sandbox_root:
+                return
+            staging_sandbox.unlink()
+        elif staging_sandbox.exists():
+            shutil.rmtree(staging_sandbox)
+        staging_sandbox.symlink_to(sandbox_root, target_is_directory=True)
 
     def _apply_network_policy(self) -> None:
         domains = list(DEFAULT_PACKAGE_DOMAINS)
