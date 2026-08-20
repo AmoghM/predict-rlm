@@ -1,6 +1,7 @@
 """Tests for structured trace output."""
 
 import contextvars
+import json
 import time
 from unittest.mock import MagicMock
 
@@ -13,6 +14,8 @@ from predict_rlm.trace import (
     PredictCallDetail,
     PredictCallGroup,
     ProposerRunTrace,
+    RunEvidence,
+    RunEvidenceEvent,
     RunTrace,
     TokenUsage,
     ToolCall,
@@ -22,6 +25,7 @@ from predict_rlm.trace import (
     drain_tool_calls,
     init_predict_call_collector,
     init_tool_call_collector,
+    lm_completion_metadata_since,
     lm_finish_since,
     ms_since,
     record_predict_call,
@@ -226,12 +230,42 @@ class TestRunTrace:
         assert trace.usage.sub.input_tokens == 0
 
     def test_status_literals(self):
-        for status in ("completed", "max_iterations", "error"):
+        for status in ("in_progress", "completed", "max_iterations", "error"):
             trace = RunTrace(
                 status=status, model="openai/gpt-5",
                 iterations=1, max_iterations=5, duration_ms=100,
             )
             assert trace.status == status
+
+    def test_atomic_export_replaces_in_progress_trace(self, tmp_path):
+        from predict_rlm.predict_rlm import PredictRLM
+
+        path = tmp_path / "predict_rlm_trace.json"
+        rlm = PredictRLM.__new__(PredictRLM)
+        rlm._trace_export_path = path
+        rlm._debug = False
+
+        first = RunTrace(
+            status="in_progress",
+            model="openai/gpt-5",
+            iterations=1,
+            max_iterations=5,
+            duration_ms=100,
+        )
+        second = RunTrace(
+            status="completed",
+            model="openai/gpt-5",
+            iterations=2,
+            max_iterations=5,
+            duration_ms=200,
+        )
+
+        rlm._export_run_trace(first)
+        assert json.loads(path.read_text())["status"] == "in_progress"
+
+        rlm._export_run_trace(second)
+        assert json.loads(path.read_text())["status"] == "completed"
+        assert not list(tmp_path.glob("*.tmp"))
 
     def test_to_exportable_json_returns_string(self):
         trace = RunTrace(
@@ -418,6 +452,90 @@ class TestRunTrace:
         assert result.count("<IMAGE_BASE_64_ENCODED(40000)>") == 4
         full = trace.model_dump()
         assert b64 in full["steps"][0]["reasoning"]
+
+    def test_to_proposer_projects_strict_evidence_without_raw_or_accounting_data(self):
+        b64 = "A" * 40000
+        trace = RunTrace(
+            status="error",
+            model="openai/gpt-5",
+            iterations=1,
+            max_iterations=5,
+            duration_ms=100,
+            evidence=RunEvidence(
+                run_id="run",
+                complete=False,
+                terminal_outcome="error",
+                events=[
+                    RunEvidenceEvent(
+                        sequence=1,
+                        kind="run.started",
+                        timestamp_ns=1,
+                        data={"inputs": {"image": f"data:image/png;base64,{b64}"}},
+                    ),
+                    RunEvidenceEvent(
+                        sequence=2,
+                        kind="iteration.recorded",
+                        timestamp_ns=2,
+                        data={
+                            "step": {
+                                "iteration": 1,
+                                "duration_ms": 100,
+                                "usage": {"input_tokens": 10, "cost": 0.2},
+                                "predict_calls": [
+                                    {
+                                        "total_usage": {
+                                            "output_tokens": 3,
+                                            "cache_hits": 1,
+                                        }
+                                    }
+                                ],
+                            }
+                        },
+                    ),
+                    RunEvidenceEvent(
+                        sequence=3,
+                        kind="tool.finished",
+                        timestamp_ns=3,
+                        data={
+                            "name": "inspect",
+                            "result": {"image": f"data:image/png;base64,{b64}"},
+                            "error": "failed usefully",
+                            "duration_ms": 9,
+                            "cost": 0.1,
+                        },
+                    ),
+                ],
+            ),
+        )
+
+        proposer = trace.to_proposer().model_dump()
+        serialized = trace.to_proposer_json()
+
+        assert proposer["evidence"]["complete"] is False
+        assert [event["kind"] for event in proposer["evidence"]["events"]] == [
+            "run.started",
+            "iteration.recorded",
+            "tool.finished",
+        ]
+        assert proposer["evidence"]["events"][0]["data"] == {}
+        assert proposer["evidence"]["events"][1]["data"] == {"iteration": 1}
+        assert proposer["evidence"]["events"][2]["data"]["name"] == "inspect"
+        assert proposer["evidence"]["events"][2]["data"]["error"] == "failed usefully"
+        assert "AAAA" not in serialized
+        assert "<IMAGE_BASE_64_ENCODED(40000)>" in serialized
+        for field in (
+            "timestamp_ns",
+            "inputs",
+            "step",
+            "duration_ms",
+            "usage",
+            "cost",
+            "cache_hits",
+            "total_usage",
+            "input_tokens",
+            "output_tokens",
+        ):
+            assert f'"{field}"' not in serialized
 
     def test_to_exportable_json_writes_file(self, tmp_path):
         trace = RunTrace(
@@ -772,6 +890,34 @@ class TestUsageSince:
         metadata = lm_finish_since(lm, 0)
 
         assert metadata == LMFinishMetadata(finish_reason="stop")
+
+    def test_lm_completion_metadata_includes_prompt_cache_stats(self):
+        lm = MagicMock()
+        lm.history = [
+            {
+                "usage": {
+                    "prompt_tokens": 1000,
+                    "completion_tokens": 50,
+                    "prompt_tokens_details": {"cached_tokens": 750},
+                },
+                "response": {"choices": [{"finish_reason": "stop"}]},
+            },
+            {
+                "usage": {
+                    "input_tokens": 500,
+                    "output_tokens": 20,
+                    "input_tokens_details": {"cached_tokens": 100},
+                },
+                "response": {"choices": [{"finish_reason": "stop"}]},
+            },
+        ]
+
+        metadata = lm_completion_metadata_since(lm, 0)
+
+        assert metadata is not None
+        assert metadata.input_tokens == 1500
+        assert metadata.cached_input_tokens == 850
+        assert metadata.cache_read_ratio == pytest.approx(850 / 1500)
 
 
 class TestConcurrentUsageAccounting:

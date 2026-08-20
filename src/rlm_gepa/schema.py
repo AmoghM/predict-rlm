@@ -151,6 +151,7 @@ class OptimizeConfig:
 
     cache: bool = False
     verbose_rlm: bool = False
+    debug_rlm: bool = False
     display_progress_bar: bool = True
     telemetry_enabled: bool = True
     telemetry_level: str = "minimal"
@@ -228,8 +229,10 @@ class EvaluationContext:
     output_dir: Path
     kind: str
     verbose_rlm: bool = False
+    debug_rlm: bool = False
     concurrency: int | None = None
     telemetry_context: TelemetryContext | None = None
+    task_resources: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -264,6 +267,12 @@ class RLMGepaProject(ABC):
         example: Any,
         context: EvaluationContext,
     ) -> RLMGepaExampleResult: ...
+
+    def task_timeout_for_example(self, example: Any, default_timeout: int) -> int:
+        return default_timeout
+
+    def task_resources_for_example(self, example: Any) -> Mapping[str, Any]:
+        return {}
 
     def component_focus(self, component_name: str) -> str:
         return ""
@@ -340,6 +349,9 @@ def validate_example_result(result: RLMGepaExampleResult) -> None:
             "RLMGepaExampleResult.traces must contain at least one RunTrace "
             "unless error is populated"
         )
+    evidence = [getattr(trace, "evidence", None) for trace in result.traces]
+    if any(item is not None and not item.complete for item in evidence):
+        raise ValueError("RLMGepaExampleResult contains incomplete strict evidence")
 
 
 def _serialize_lm(value: Any) -> str:

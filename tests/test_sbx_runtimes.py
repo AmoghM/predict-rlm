@@ -16,8 +16,16 @@ from pathlib import Path
 
 import pytest
 
-from predict_rlm.interpreter import SandboxFatalError
-from predict_rlm.interpreters import SbxConfig, SbxInterpreter
+# The docker/host runtimes lived on the legacy SbxInterpreter, which upstream
+# replaced with predict_rlm.backends.sbx. These tests are kept as the spec for
+# porting the runtimes onto the new backend; they skip until that port lands.
+pytest.importorskip(
+    "predict_rlm.interpreters",
+    reason="docker/host SBX runtimes pending port to predict_rlm.backends.sbx",
+)
+
+from predict_rlm.interpreter import SandboxFatalError  # noqa: E402
+from predict_rlm.interpreters import SbxConfig, SbxInterpreter  # noqa: E402
 
 
 def _host_interpreter(tmp_path: Path) -> SbxInterpreter:

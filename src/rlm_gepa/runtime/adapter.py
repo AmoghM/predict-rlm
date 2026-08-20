@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from collections.abc import Mapping, Sequence
@@ -68,6 +69,7 @@ class RLMGepaAdapter:
         proposer_timeout: int = 600,
         heartbeat_interval_seconds: float = 30.0,
         verbose_rlm: bool = False,
+        debug_rlm: bool = False,
         display_progress_bar: bool = False,
         valset_size: int | None = None,
         telemetry_context: TelemetryContext | None = None,
@@ -81,6 +83,7 @@ class RLMGepaAdapter:
         self.output_dir = Path(output_dir)
         self.run_id = run_id
         self.verbose_rlm = verbose_rlm
+        self.debug_rlm = debug_rlm
         self.task_trace_dir = self.output_dir / "task_traces"
         self.proposer_trace_dir = self.output_dir / "proposer_traces"
         self.cost_log_path = self.output_dir / "cost_log.jsonl"
@@ -113,6 +116,7 @@ class RLMGepaAdapter:
                 heartbeat_interval_seconds=heartbeat_interval_seconds,
                 run_id=run_id,
                 component_focus=project.component_focus,
+                debug_rlm=debug_rlm,
             )
             self.propose_new_texts = proposer.propose_new_texts
 
@@ -190,6 +194,7 @@ class RLMGepaAdapter:
             output_dir=self.output_dir,
             kind=eval_kind,
             verbose_rlm=self.verbose_rlm,
+            debug_rlm=self.debug_rlm,
             concurrency=self.concurrency,
             telemetry_context=eval_telemetry_context,
         )
@@ -199,8 +204,11 @@ class RLMGepaAdapter:
         progress_label = self._progress_label(eval_kind, eval_idx, capture_traces)
 
         async def run_one(index: int, example: Any) -> tuple[int, RLMGepaExampleResult]:
+            example_timeout = self.project.task_timeout_for_example(example, self.task_timeout)
             example_context = replace(
                 context,
+                task_timeout=example_timeout,
+                task_resources=self.project.task_resources_for_example(example),
                 telemetry_context=self._example_telemetry_context(
                     eval_telemetry_context,
                     example=example,
@@ -225,16 +233,16 @@ class RLMGepaAdapter:
                     try:
                         result = await asyncio.wait_for(
                             self.project.evaluate_example(candidate, example, example_context),
-                            timeout=self.task_timeout,
+                            timeout=example_timeout,
                         )
                     except asyncio.TimeoutError:
                         self._write_outer_timeout_event(example_context, example, index)
                         result = RLMGepaExampleResult(
                             score=0.0,
-                            feedback=f"evaluation timeout at {self.task_timeout}s",
+                            feedback=f"evaluation timeout at {example_timeout}s",
                             traces=[],
                             example_id=example_id,
-                            error=f"timeout at {self.task_timeout}s",
+                            error=f"timeout at {example_timeout}s",
                         )
                     except Exception as exc:
                         trace = extract_trace_from_exc(exc)
@@ -304,7 +312,7 @@ class RLMGepaAdapter:
         have_objective_scores = False
 
         self.task_trace_dir.mkdir(parents=True, exist_ok=True)
-        trace_path = self.task_trace_dir / f"{event_id}_{eval_kind}.jsonl"
+        trace_path = self.task_trace_dir / f"{_trace_file_stem(event_id, eval_kind)}.jsonl"
         with trace_path.open("x", encoding="utf-8") as f:
             for index, result in enumerate(results):
                 example_id = result.example_id or str(index)
@@ -459,11 +467,11 @@ class RLMGepaAdapter:
                 event_domain="spreadbench",
                 status={
                     "code": "ERROR",
-                    "message": f"outer task timeout at {self.task_timeout}s",
+                    "message": f"outer task timeout at {context.task_timeout}s",
                 },
                 attributes={
                     "rlm.phase": context.kind,
-                    "rlm.configured_timeout_sec": self.task_timeout,
+                    "rlm.configured_timeout_sec": context.task_timeout,
                     "rlm.concurrency": self.concurrency,
                     "spreadbench.case_idx": index,
                     "spreadbench.example_id": telemetry_context.example_id
@@ -520,7 +528,7 @@ class RLMGepaAdapter:
             skills=[],
             max_iterations=self.proposer_max_iterations,
             verbose=True,
-            debug=False,
+            debug=self.debug_rlm,
         )
         progress_write("\n" + "=" * 80)
         progress_write(f"RLM PATCH MERGE PROPOSER STARTING (call {call_idx})")
@@ -922,6 +930,14 @@ def _append_eval_progress_event(
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(payload, default=str) + "\n")
         f.flush()
+
+
+def _trace_file_stem(event_id: str, eval_kind: str, *, max_length: int = 160) -> str:
+    stem = f"{event_id}_{eval_kind}"
+    if len(stem) <= max_length:
+        return stem
+    digest = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:12]
+    return f"{stem[: max_length - len(digest) - 1]}-{digest}"
 
 
 def _batch_signature(batch: Sequence[Any]) -> tuple[str, ...]:

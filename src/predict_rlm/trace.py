@@ -62,6 +62,18 @@ class _LMCompletionMetadata(BaseModel):
         default=None,
         description="Configured/requested output token cap if discoverable",
     )
+    input_tokens: int | None = Field(
+        default=None,
+        description="Input/prompt tokens reported for the LM call(s)",
+    )
+    cached_input_tokens: int | None = Field(
+        default=None,
+        description="OpenAI prompt-cache read tokens reported for the LM call(s)",
+    )
+    cache_read_ratio: float | None = Field(
+        default=None,
+        description="Cached input tokens divided by total input tokens, if known",
+    )
     output_tokens: int | None = Field(
         default=None,
         description="Output/completion tokens reported for the LM call(s)",
@@ -170,7 +182,7 @@ class ProposerIterationStep(BaseModel):
     )
     code: str = Field(description="Python code executed for this iteration")
     output: str = Field(
-        description="Sandbox output visible in later model context, shortened to 5K chars"
+        description="Sandbox output visible in later model context, shortened by max_output_chars"
     )
     untruncated_output: str = Field(
         description="Full sandbox output before context shortening"
@@ -190,6 +202,33 @@ class ProposerIterationStep(BaseModel):
     )
 
 
+class RunEvidenceEvent(BaseModel):
+    sequence: int
+    kind: str
+    timestamp_ns: int
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class RunEvidence(BaseModel):
+    run_id: str
+    complete: bool
+    terminal_outcome: str | None = None
+    events: list[RunEvidenceEvent] = Field(default_factory=list)
+
+
+class ProposerRunEvidenceEvent(BaseModel):
+    sequence: int
+    kind: str
+    data: dict[str, Any] = Field(default_factory=dict)
+
+
+class ProposerRunEvidence(BaseModel):
+    run_id: str
+    complete: bool
+    terminal_outcome: str | None = None
+    events: list[ProposerRunEvidenceEvent] = Field(default_factory=list)
+
+
 class ProposerRunTrace(BaseModel):
     """Subset of RunTrace intended for instruction proposer inputs.
 
@@ -198,7 +237,7 @@ class ProposerRunTrace(BaseModel):
     and durations.
     """
 
-    status: Literal["completed", "max_iterations", "error"] = Field(
+    status: Literal["in_progress", "completed", "max_iterations", "error"] = Field(
         description="Run completion status"
     )
     model: str = Field(description="Main LM model identifier")
@@ -212,6 +251,14 @@ class ProposerRunTrace(BaseModel):
     steps: list[ProposerIterationStep] = Field(
         default_factory=list, description="Per-iteration execution steps"
     )
+    evidence: ProposerRunEvidence | None = None
+
+
+class LMUsage(BaseModel):
+    """Token usage split by main LM and sub-LM."""
+
+    main: TokenUsage = Field(default_factory=TokenUsage, description="Main LM token usage")
+    sub: TokenUsage = Field(default_factory=TokenUsage, description="Sub-LM token usage")
 
 
 class IterationStep(BaseModel):
@@ -223,7 +270,7 @@ class IterationStep(BaseModel):
     )
     code: str = Field(description="Python code executed for this iteration")
     output: str = Field(
-        description="Sandbox output visible in later model context, shortened to 5K chars"
+        description="Sandbox output visible in later model context, shortened by max_output_chars"
     )
     untruncated_output: str = Field(
         description="Full sandbox output before context shortening"
@@ -242,13 +289,13 @@ class IterationStep(BaseModel):
         default=None,
         description="Why the main LM stopped while generating this iteration's code",
     )
-
-
-class LMUsage(BaseModel):
-    """Token usage split by main LM and sub-LM."""
-
-    main: TokenUsage = Field(default_factory=TokenUsage, description="Main LM token usage")
-    sub: TokenUsage = Field(default_factory=TokenUsage, description="Sub-LM token usage")
+    usage: LMUsage = Field(
+        default_factory=LMUsage,
+        description=(
+            "Per-iteration token usage and cost, split into the main action-LM "
+            "call and any sub-LM predict() calls made during this iteration"
+        ),
+    )
 
 
 class RunTrace(BaseModel):
@@ -259,8 +306,9 @@ class RunTrace(BaseModel):
     .. warning:: This schema is experimental and may change in future versions.
     """
 
-    status: Literal["completed", "max_iterations", "error"] = Field(
+    status: Literal["in_progress", "completed", "max_iterations", "error"] = Field(
         description=(
+            "'in_progress' if exported while the run is still active, "
             "'completed' if SUBMIT was called, "
             "'max_iterations' if extract fallback was used, "
             "'error' if the run failed"
@@ -301,6 +349,10 @@ class RunTrace(BaseModel):
     )
     steps: list[IterationStep] = Field(
         default_factory=list, description="Per-iteration execution steps"
+    )
+    evidence: RunEvidence | None = Field(
+        default=None,
+        description="Strict lifecycle evidence completed after session release",
     )
 
     def __repr__(self) -> str:
@@ -384,6 +436,23 @@ class RunTrace(BaseModel):
                 )
                 for step in self.steps
             ],
+            evidence=(
+                ProposerRunEvidence(
+                    run_id=self.evidence.run_id,
+                    complete=self.evidence.complete,
+                    terminal_outcome=self.evidence.terminal_outcome,
+                    events=[
+                        ProposerRunEvidenceEvent(
+                            sequence=event.sequence,
+                            kind=event.kind,
+                            data=_proposer_evidence_data(event),
+                        )
+                        for event in self.evidence.events
+                    ],
+                )
+                if self.evidence is not None
+                else None
+            ),
         )
 
     def to_proposer_json(self, path: str | Path | None = None, indent: int = 2) -> str:
@@ -399,6 +468,43 @@ class RunTrace(BaseModel):
 # ---------------------------------------------------------------------------
 
 _BASE64_DATA_RE = re.compile(r"data:image/([^;]+);base64,([A-Za-z0-9+/=]+)")
+
+_PROPOSER_ACCOUNTING_KEYS = {
+    "cache_hits",
+    "cost",
+    "duration_ms",
+    "input_tokens",
+    "output_tokens",
+    "total_tokens",
+    "total_usage",
+    "usage",
+}
+
+
+def _proposer_evidence_data(event: RunEvidenceEvent) -> dict[str, Any]:
+    data = dict(event.data)
+    if event.kind == "run.started":
+        data.pop("inputs", None)
+    elif event.kind == "iteration.recorded":
+        step = data.get("step")
+        return (
+            {"iteration": step["iteration"]}
+            if isinstance(step, dict) and "iteration" in step
+            else {}
+        )
+    return _sanitize_for_trace(_without_accounting(data))
+
+
+def _without_accounting(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _without_accounting(item)
+            for key, item in value.items()
+            if key not in _PROPOSER_ACCOUNTING_KEYS
+        }
+    if isinstance(value, list):
+        return [_without_accounting(item) for item in value]
+    return value
 
 
 def _sanitize_for_trace(value: Any) -> Any:
@@ -659,6 +765,18 @@ def merge_lm_truncation(
         left.output_tokens = right.output_tokens
     elif right.output_tokens is not None:
         left.output_tokens += right.output_tokens
+    if left.input_tokens is None:
+        left.input_tokens = right.input_tokens
+    elif right.input_tokens is not None:
+        left.input_tokens += right.input_tokens
+    if left.cached_input_tokens is None:
+        left.cached_input_tokens = right.cached_input_tokens
+    elif right.cached_input_tokens is not None:
+        left.cached_input_tokens += right.cached_input_tokens
+    if left.input_tokens:
+        left.cache_read_ratio = (left.cached_input_tokens or 0) / left.input_tokens
+    elif left.cached_input_tokens is not None:
+        left.cache_read_ratio = 0.0
     return left
 
 
@@ -671,19 +789,35 @@ def lm_truncation_from_history_entry(
 
     finish_reason = _extract_finish_reason(entry.get("response"))
     max_tokens = _extract_max_tokens(entry, lm=lm)
+    input_tokens = _extract_input_tokens(entry)
+    cached_input_tokens = _extract_cached_input_tokens(entry)
     output_tokens = _extract_output_tokens(entry)
     truncated, reason = _classify_truncation(
         finish_reason=finish_reason,
         max_tokens=max_tokens,
         output_tokens=output_tokens,
     )
-    if finish_reason is None and max_tokens is None and output_tokens is None:
+    if (
+        finish_reason is None
+        and max_tokens is None
+        and input_tokens is None
+        and cached_input_tokens is None
+        and output_tokens is None
+    ):
         return None
+    cache_read_ratio = None
+    if input_tokens:
+        cache_read_ratio = (cached_input_tokens or 0) / input_tokens
+    elif cached_input_tokens is not None:
+        cache_read_ratio = 0.0
     return _LMCompletionMetadata(
         truncated=truncated,
         truncation_reason=reason,
         finish_reason=finish_reason,
         max_tokens=max_tokens,
+        input_tokens=input_tokens,
+        cached_input_tokens=cached_input_tokens,
+        cache_read_ratio=cache_read_ratio,
         output_tokens=output_tokens,
     )
 
@@ -717,6 +851,38 @@ def _extract_finish_reason(response: Any) -> str | None:
         finish_reason = _get_value(choice, "finish_reason")
         if finish_reason is not None:
             return str(finish_reason)
+    return None
+
+
+def _extract_input_tokens(entry: dict[str, Any]) -> int | None:
+    usage = entry.get("usage", {}) or {}
+    for key in ("prompt_tokens", "input_tokens"):
+        value = _coerce_int(_get_value(usage, key))
+        if value is not None:
+            return value
+    response_usage = _get_value(entry.get("response"), "usage")
+    for key in ("prompt_tokens", "input_tokens"):
+        value = _coerce_int(_get_value(response_usage, key))
+        if value is not None:
+            return value
+    return None
+
+
+def _extract_cached_input_tokens(entry: dict[str, Any]) -> int | None:
+    usage = entry.get("usage", {}) or {}
+    value = _extract_cached_tokens_from_usage(usage)
+    if value is not None:
+        return value
+    response_usage = _get_value(entry.get("response"), "usage")
+    return _extract_cached_tokens_from_usage(response_usage)
+
+
+def _extract_cached_tokens_from_usage(usage: Any) -> int | None:
+    for details_key in ("prompt_tokens_details", "input_tokens_details"):
+        details = _get_value(usage, details_key)
+        value = _coerce_int(_get_value(details, "cached_tokens"))
+        if value is not None:
+            return value
     return None
 
 

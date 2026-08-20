@@ -30,6 +30,24 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, Field
 
+from .runtime import FieldDescriptor
+
+__all__ = [
+    "File",
+    "LocalDir",
+    "LocalFile",
+    "OutputDir",
+    "OutputFile",
+    "SyncedFile",
+    "build_file_instructions",
+    "build_file_plan",
+    "get_synced_file_params",
+    "is_file_type",
+    "is_input_file_type",
+    "is_output_file_type",
+    "scan_file_fields",
+]
+
 
 class File(BaseModel):
     """A file reference for PredictRLM signatures.
@@ -93,38 +111,9 @@ class SyncedFile:
     as-is and not cleaned up."""
 
 
-def _unwrap_annotation(annotation: Any) -> Any:
-    """Unwrap Optional/Annotated/list to get the inner file type."""
-    origin = typing.get_origin(annotation)
-    if origin is typing.Union:
-        args = [a for a in typing.get_args(annotation) if a is not type(None)]
-        if len(args) == 1:
-            return _unwrap_annotation(args[0])
-    if origin is typing.Annotated:
-        return _unwrap_annotation(typing.get_args(annotation)[0])
-    if origin is list:
-        args = typing.get_args(annotation)
-        if args:
-            return _unwrap_annotation(args[0])
-    return annotation
-
-
-def _is_list_annotation(annotation: Any) -> bool:
-    """Check if an annotation is list[...] (possibly wrapped in Optional)."""
-    origin = typing.get_origin(annotation)
-    if origin is typing.Union:
-        args = [a for a in typing.get_args(annotation) if a is not type(None)]
-        if len(args) == 1:
-            return _is_list_annotation(args[0])
-    if origin is typing.Annotated:
-        return _is_list_annotation(typing.get_args(annotation)[0])
-    return origin is list
-
-
 def is_file_type(annotation: Any) -> bool:
     """Check if a field annotation is File or list[File]."""
-    inner = _unwrap_annotation(annotation)
-    return isinstance(inner, type) and issubclass(inner, File)
+    return FieldDescriptor("", annotation).matches(File)
 
 
 # Deprecated aliases
@@ -145,15 +134,15 @@ def scan_file_fields(
     output_file_fields: dict[str, str] = {}
 
     for name, field in signature.input_fields.items():
-        annotation = field.annotation
-        if is_file_type(annotation):
-            kind = "list_file" if _is_list_annotation(annotation) else "file"
+        descriptor = FieldDescriptor(name, field.annotation)
+        if descriptor.matches(File):
+            kind = "list_file" if descriptor.is_list else "file"
             input_file_fields[name] = kind
 
     for name, field in signature.output_fields.items():
-        annotation = field.annotation
-        if is_file_type(annotation):
-            kind = "list_file" if _is_list_annotation(annotation) else "file"
+        descriptor = FieldDescriptor(name, field.annotation)
+        if descriptor.matches(File):
+            kind = "list_file" if descriptor.is_list else "file"
             output_file_fields[name] = kind
 
     return input_file_fields, output_file_fields
@@ -281,7 +270,8 @@ def build_file_plan(
         }
 
     instructions = build_file_instructions(
-        input_mounts_for_instructions, output_dirs_for_instructions
+        input_mounts_for_instructions,
+        output_dirs_for_instructions,
     )
 
     return {

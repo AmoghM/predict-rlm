@@ -2,7 +2,7 @@
 
 Background:
     Sandbox code calling ``await recalculate(path)`` triggers a host
-    tool dispatch in ``JspiInterpreter._execute_tool_async``. If the
+    tool dispatch in ``JspiBackend._execute_tool_async``. If the
     tool is slow (e.g. LibreOffice on a whole-column formula → 2-3
     minutes), the overall ``execute`` round-trip blows past the
     ``_exec_timeout`` ceiling. That timeout **kills the Deno
@@ -29,22 +29,19 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import sys
-import threading
+import inspect
 import time
 from pathlib import Path
 
 import pytest
 
-import predict_rlm.interpreter as rlm_interpreter
-from predict_rlm.interpreter import JspiInterpreter
-from predict_rlm.interpreters import SbxConfig, SbxInterpreter
-
-RUNNER_PATH = Path(__file__).parents[1] / "src" / "predict_rlm" / "sandbox" / "python_runner.py"
+import predict_rlm.backends.jspi.backend as rlm_interpreter
+from predict_rlm.backends import JspiBackend
+from predict_rlm.predict_rlm import PredictRLM
 
 
 def _build_interp_with_tool(tool_fn, tool_name: str = "slow_tool"):
-    interp = JspiInterpreter.__new__(JspiInterpreter)
+    interp = JspiBackend.__new__(JspiBackend)
     interp.tools = {tool_name: tool_fn}
     interp._debug = False
     interp._executor = None  # only used for sync tools
@@ -165,159 +162,38 @@ def test_sync_tool_timeout_does_not_poison_executor(monkeypatch):
         interp._executor.shutdown(wait=False, cancel_futures=True)
 
 
-# ---------------------------------------------------------------------------
-# SBX backend parity
-#
-# The SBX interpreter had NO per-tool-call bound at all: ``_build_tool_response``
-# called ``tool(*args, **kwargs)`` directly in a ThreadPoolExecutor thread and
-# the only ceiling was the whole-request ``exec_timeout``, which KILLS the
-# runner process (``_fail_timed_out_request`` -> ``SandboxFatalError``). A slow
-# tool therefore destroyed the sandbox instead of producing a recoverable
-# error, the exact failure mode the JSPI tests above exist to prevent.
-# ---------------------------------------------------------------------------
+def test_evidence_wrapped_sync_tool_deadline_does_not_wait_for_worker(monkeypatch):
+    monkeypatch.setattr(rlm_interpreter, "TOOL_CALL_TIMEOUT_SEC", 0.02)
+    started = __import__("threading").Event()
+    release = __import__("threading").Event()
 
+    def _blocked_tool():
+        started.set()
+        release.wait()
+        return "late"
 
-class TestSbxToolCallTimeout:
-    def make_interpreter(self, tmp_path: Path, tools: dict, **config) -> SbxInterpreter:
-        return SbxInterpreter(
-            config=SbxConfig(name="tool-timeout-test", **config),
-            tools=tools,
-            preinstall_packages=False,
-            _runner_command=[sys.executable, "-u", str(RUNNER_PATH)],
-            _staging_root=tmp_path / "staging",
+    owner = type("EvidenceOwner", (), {"_evidence": lambda self: None})()
+    wrapped = PredictRLM._wrap_evidence_tool(owner, "slow_tool", _blocked_tool)
+    interp = _build_interp_with_tool(wrapped)
+
+    assert not inspect.iscoroutinefunction(inspect.unwrap(wrapped))
+
+    async def _run():
+        started_at = time.monotonic()
+        response = await interp._execute_tool_async(
+            "slow_tool",
+            {"args": [], "kwargs": {}},
         )
+        return response, time.monotonic() - started_at
 
-    def test_default_tool_call_timeout_matches_jspi(self):
-        """SBX's default per-tool budget matches JSPI's 180s."""
-        assert SbxConfig().tool_call_timeout == rlm_interpreter.TOOL_CALL_TIMEOUT_SEC
+    timer = __import__("threading").Timer(0.4, release.set)
+    timer.start()
+    try:
+        response, elapsed = asyncio.run(_run())
+    finally:
+        release.set()
+        timer.cancel()
 
-    def test_tool_budget_stays_below_exec_timeout(self):
-        """The per-tool guard is useless unless it fires BEFORE the
-        whole-request wall that kills the runner, so a misconfigured
-        (or merely default) tool budget is clamped under exec_timeout.
-        """
-        interp = SbxInterpreter.__new__(SbxInterpreter)
-        interp.config = SbxConfig(exec_timeout=10, tool_call_timeout=180)
-        assert interp._tool_call_budget() < 10
-
-        interp.config = SbxConfig(exec_timeout=300, tool_call_timeout=180)
-        assert interp._tool_call_budget() == 180
-
-    def test_hanging_tool_is_recoverable_and_sandbox_survives(self, tmp_path: Path):
-        """A wedged tool must surface as a normal in-sandbox error and
-        leave the runner alive for the next call — not trip exec_timeout
-        and kill the process.
-        """
-        release = threading.Event()
-
-        def hang() -> str:
-            release.wait(30)
-            return "unreachable"
-
-        def quick() -> str:
-            return "quick"
-
-        interpreter = self.make_interpreter(
-            tmp_path,
-            {"hang": hang, "quick": quick},
-            exec_timeout=20,
-            tool_call_timeout=0.3,
-        )
-        try:
-            started = time.monotonic()
-            output = interpreter.execute(
-                "try:\n"
-                "    await hang()\n"
-                "except Exception as exc:\n"
-                "    print('TOOLERR:', exc)\n"
-            )
-            elapsed = time.monotonic() - started
-
-            assert "TOOLERR:" in output, f"tool error never reached the sandbox: {output!r}"
-            assert "timed out" in output.lower(), output
-            assert elapsed < 10, (
-                f"took {elapsed:.1f}s — the per-tool budget did not fire"
-            )
-
-            # Sandbox survived: a subsequent call still works, and the
-            # interpreter state from before the hang is intact.
-            assert interpreter.execute("print(await quick())").strip() == "quick"
-        finally:
-            release.set()
-            interpreter.shutdown()
-
-    def test_hung_tool_does_not_starve_later_tool_calls(self, tmp_path: Path):
-        """The abandoned thread can't be killed, so the executor must be
-        recycled — otherwise repeated hangs exhaust the worker pool.
-        """
-        release = threading.Event()
-
-        def hang() -> str:
-            release.wait(30)
-            return "unreachable"
-
-        def quick() -> str:
-            return "quick"
-
-        interpreter = self.make_interpreter(
-            tmp_path,
-            {"hang": hang, "quick": quick},
-            exec_timeout=20,
-            tool_call_timeout=0.3,
-        )
-        try:
-            # Wedge every worker in the original pool.
-            for _ in range(6):
-                interpreter.execute(
-                    "try:\n    await hang()\nexcept Exception:\n    pass\n"
-                )
-            started = time.monotonic()
-            assert interpreter.execute("print(await quick())").strip() == "quick"
-            assert time.monotonic() - started < 3, "later tool call was starved"
-        finally:
-            release.set()
-            interpreter.shutdown()
-
-    def test_quick_tool_is_unaffected_by_the_budget(self, tmp_path: Path):
-        """The budget is a ceiling, not a delay."""
-
-        def quick(value: int) -> dict:
-            return {"doubled": value * 2}
-
-        interpreter = self.make_interpreter(
-            tmp_path, {"quick": quick}, exec_timeout=20, tool_call_timeout=5
-        )
-        try:
-            started = time.monotonic()
-            output = interpreter.execute(
-                "result = await quick(21)\nprint(result['doubled'])"
-            )
-        finally:
-            interpreter.shutdown()
-
-        assert output.strip() == "42"
-        assert time.monotonic() - started < 5
-
-    def test_tool_exception_still_routes_as_error_not_timeout(self, tmp_path: Path):
-        """A raising tool keeps its own message; the timeout wrap must
-        not swallow or relabel it.
-        """
-
-        def boom() -> str:
-            raise ValueError("tool blew up")
-
-        interpreter = self.make_interpreter(
-            tmp_path, {"boom": boom}, exec_timeout=20, tool_call_timeout=5
-        )
-        try:
-            output = interpreter.execute(
-                "try:\n"
-                "    await boom()\n"
-                "except Exception as exc:\n"
-                "    print('TOOLERR:', exc)\n"
-            )
-        finally:
-            interpreter.shutdown()
-
-        assert "blew up" in output
-        assert "timed out" not in output.lower()
+    assert elapsed < 0.15
+    assert "timed out" in response["error"]
+    assert interp.has_live_sync_workers()

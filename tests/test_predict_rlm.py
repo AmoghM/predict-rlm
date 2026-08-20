@@ -3,13 +3,15 @@
 import asyncio
 import hashlib
 import logging
+import re
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import dspy
 import pytest
+from dspy.primitives.code_interpreter import FinalOutput
 from dspy.primitives.repl_types import REPLEntry, REPLHistory
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, ValidationError
 
 from predict_rlm import PredictRLM, SbxPool
 from predict_rlm.predict_rlm import (
@@ -19,7 +21,12 @@ from predict_rlm.predict_rlm import (
 )
 from predict_rlm.rlm_skills import Skill
 from predict_rlm.telemetry import TelemetryContext, classify_failure
-from predict_rlm.trace import drain_predict_calls, init_predict_call_collector
+from predict_rlm.trace import (
+    LMFinishMetadata,
+    drain_predict_calls,
+    init_predict_call_collector,
+    lm_completion_metadata_since,
+)
 
 
 def _run(coro):
@@ -29,6 +36,23 @@ def _run(coro):
     nest_asyncio.apply()
     loop = asyncio.get_event_loop()
     return loop.run_until_complete(coro)
+
+
+def _log_messages(caplog, logger_name: str) -> str:
+    return "\n".join(
+        record.getMessage()
+        for record in caplog.records
+        if record.name.startswith(logger_name)
+    )
+
+
+def _assert_raw_verbose_output(output: str) -> None:
+    assert "[INFO]" not in output
+    assert "predict_rlm.trace" not in output
+
+
+def _strip_ansi(output: str) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", output)
 
 
 class ImageAnalysisSignature(dspy.Signature):
@@ -71,14 +95,55 @@ class ListTelemetrySink:
         self.records.append(record)
 
 
-class TestSandboxBackendSelection:
-    """Tests for PredictRLM sandbox backend selection."""
+class FakeSubmitRepl:
+    def __init__(self, final_payload: dict[str, Any] | None = None):
+        self.final_payload = final_payload or {"answer": "done"}
+        self.executed: list[str] = []
+        self.defer_count = 0
+        self.deferred_submit_count = 0
+
+    def defer_next_submit_finalization(self) -> None:
+        self.defer_count += 1
+        self._defer_next_submit = True
+
+    def execute(self, code, variables=None, timeout=None):
+        self.executed.append(code)
+        if code.startswith("SUBMIT"):
+            if getattr(self, "_defer_next_submit", False):
+                self._defer_next_submit = False
+                self.deferred_submit_count += 1
+            return FinalOutput(self.final_payload)
+        self._defer_next_submit = False
+        return "checked output"
+
+    async def aexecute(self, code, variables=None, timeout=None):
+        return self.execute(code, variables=variables, timeout=timeout)
+
+
+class FakeInterpreterContext:
+    def __init__(self, repl):
+        self.repl = repl
+
+    def __enter__(self):
+        return self.repl
+
+    def __exit__(self, *_args):
+        return False
+
+
+@pytest.mark.sbx
+class TestBackendNameSelection:
+    """Tests for PredictRLM sandbox backend selection.
+
+    Marked ``sbx`` because several cases import SBX symbols (SbxConfig/SbxPool),
+    which resolve the lazy SBX backend import and require the [sbx] extra.
+    """
 
     def test_default_backend_remains_jspi(self):
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=1)
         execution_tools = {"predict": MagicMock()}
 
-        with patch("predict_rlm.predict_rlm.JspiInterpreter") as mock_jspi:
+        with patch("predict_rlm.predict_rlm.JspiBackend") as mock_jspi:
             mock_repl = MagicMock()
             mock_jspi.return_value = mock_repl
 
@@ -89,18 +154,18 @@ class TestSandboxBackendSelection:
         assert mock_jspi.call_args.kwargs["tools"] == execution_tools
 
     def test_explicit_sbx_backend_uses_sbx_interpreter(self):
-        from predict_rlm import SandboxBackend, SbxConfig
+        from predict_rlm import BackendName, SbxConfig
 
         rlm = PredictRLM(
             ImageAnalysisSignature,
             sub_lm=MagicMock(),
             max_iterations=1,
-            sandbox_backend=SandboxBackend.SBX,
+            sandbox_backend=BackendName.SBX,
             sbx_config=SbxConfig(name="test-sbx"),
         )
         execution_tools = {"predict": MagicMock()}
 
-        with patch("predict_rlm.predict_rlm.SbxInterpreter") as mock_sbx:
+        with patch("predict_rlm.backends.sbx.SbxBackend") as mock_sbx:
             mock_repl = MagicMock()
             mock_sbx.return_value = mock_repl
 
@@ -121,7 +186,137 @@ class TestSandboxBackendSelection:
                 sandbox_backend="sbx",
             )
 
+    def test_debug_configures_injected_interpreter_debug(self):
+        interpreter = MagicMock()
+        interpreter.configure_debug = MagicMock()
+        interpreter.shutdown = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            debug=True,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+            interpreter.configure_debug.assert_called_once_with(True)
+
+        interpreter.shutdown.assert_not_called()
+
+    def test_verbose_configures_injected_interpreter_verbose(self):
+        interpreter = MagicMock()
+        interpreter.configure_verbose = MagicMock()
+        interpreter.shutdown = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            verbose=True,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+            interpreter.configure_verbose.assert_called_once_with(True)
+
+        interpreter.shutdown.assert_not_called()
+
+    def test_default_verbose_configures_injected_interpreter_verbose(self):
+        interpreter = MagicMock()
+        interpreter.configure_verbose = MagicMock()
+        interpreter.shutdown = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+            interpreter.configure_verbose.assert_called_once_with(True)
+
+        interpreter.shutdown.assert_not_called()
+
+    def test_explicit_false_verbose_configures_injected_interpreter_quiet(self):
+        interpreter = MagicMock()
+        interpreter.configure_verbose = MagicMock()
+        interpreter.shutdown = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            verbose=False,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+            interpreter.configure_verbose.assert_called_once_with(False)
+
+        interpreter.shutdown.assert_not_called()
+
+    def test_configures_injected_interpreter_runtime_logging(self):
+        class Interpreter:
+            def __init__(self) -> None:
+                self.tools = {}
+                self.output_fields = []
+                self.runtime_kwargs = None
+                self.shutdown = MagicMock()
+
+            def configure_runtime(self, **kwargs):
+                self.runtime_kwargs = kwargs
+
+        interpreter = Interpreter()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            debug=True,
+            verbose=True,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+
+        assert interpreter.runtime_kwargs == {"debug": True, "verbose": True}
+        interpreter.shutdown.assert_not_called()
+
+    def test_injected_interpreter_logging_does_not_mutate_ad_hoc_attrs(self):
+        class Interpreter:
+            def __init__(self) -> None:
+                self.tools = {}
+                self.output_fields = []
+                self.debug = False
+                self._debug = False
+                self.verbose = False
+                self._verbose = False
+                self.shutdown = MagicMock()
+
+        interpreter = Interpreter()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=1,
+            interpreter=interpreter,
+            debug=True,
+            verbose=True,
+        )
+
+        with rlm._interpreter_context(execution_tools={"predict": MagicMock()}) as repl:
+            assert repl is interpreter
+
+        assert interpreter.debug is False
+        assert interpreter._debug is False
+        assert interpreter.verbose is False
+        assert interpreter._verbose is False
+        interpreter.shutdown.assert_not_called()
+
     def test_sbx_pool_requires_sbx_backend(self):
+        from predict_rlm import SbxPool
+
         with pytest.raises(ValueError, match="sbx_pool.*sandbox_backend='sbx'"):
             PredictRLM(
                 ImageAnalysisSignature,
@@ -131,6 +326,8 @@ class TestSandboxBackendSelection:
             )
 
     def test_sbx_pool_conflicts_with_custom_interpreter(self):
+        from predict_rlm import SbxPool
+
         with pytest.raises(ValueError, match="interpreter.*sbx_pool"):
             PredictRLM(
                 ImageAnalysisSignature,
@@ -143,6 +340,8 @@ class TestSandboxBackendSelection:
 
     def test_sbx_pool_leases_without_constructing_or_shutting_down_interpreter(self):
         from contextlib import contextmanager
+
+        from predict_rlm import SbxPool
 
         leased = MagicMock()
         leased.shutdown = MagicMock()
@@ -160,15 +359,19 @@ class TestSandboxBackendSelection:
             max_iterations=1,
             sandbox_backend="sbx",
             sbx_pool=pool,
+            debug=True,
         )
         execution_tools = {"predict": MagicMock()}
 
-        with patch("predict_rlm.predict_rlm.SbxInterpreter") as mock_sbx:
+        with patch("predict_rlm.backends.sbx.SbxBackend") as mock_sbx:
             with rlm._interpreter_context(execution_tools=execution_tools) as repl:
                 assert repl is leased
 
         pool.lease.assert_called_once()
         assert pool.lease_kwargs["tools"] == execution_tools
+        assert pool.lease_kwargs["output_fields"] == rlm._get_output_fields_info()
+        assert pool.lease_kwargs["debug"] is True
+        assert pool.lease_kwargs["verbose"] is True
         mock_sbx.assert_not_called()
         leased.shutdown.assert_not_called()
 
@@ -184,6 +387,112 @@ class TestPredictRLMOutputDefaults:
                 "default": None,
             }
         ]
+
+
+class TestVerboseDebugLogging:
+    def test_verbose_streams_iteration_header_before_execute_and_output_after(self, capsys):
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=5,
+            verbose=True,
+        )
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('model authored')\nprint('done')"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        seen: dict[str, str] = {}
+
+        class Repl:
+            def execute(self, code, variables=None):
+                from predict_rlm._logging import (
+                    emit_trace_tool_call,
+                    live_tool_call_logging_enabled,
+                )
+
+                seen["before_execute"] = capsys.readouterr().err
+                assert live_tool_call_logging_enabled() is True
+                emit_trace_tool_call("lookup", args=["needle"], kwargs={"limit": 1})
+                return "visible output"
+
+        with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+            rlm._execute_iteration(
+                repl=Repl(),
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
+
+        before_execute = seen["before_execute"]
+        after_execute = capsys.readouterr().err
+        before_text = _strip_ansi(before_execute)
+        after_text = _strip_ansi(after_execute)
+
+        _assert_raw_verbose_output(before_execute)
+        _assert_raw_verbose_output(after_execute)
+        assert "\033[1;97mRLM turn \033[1;32m1\033[1;97m/5" in before_execute
+        assert "RLM turn 1/5" in before_text
+        assert "reasoning:" in before_text
+        assert "thinking" in before_text
+        assert "code:" in before_text
+        assert "model authored" in before_text
+        assert "output:" not in before_text
+
+        assert "Tool: lookup(" in after_text
+        assert '"args": ["needle"]' in after_text
+        assert '"kwargs": {"limit": 1}' in after_text
+        assert "output:" in after_text
+        assert "visible output" in after_text
+
+    def test_debug_logs_lifecycle_without_verbose_trace(self, capsys, caplog):
+        caplog.set_level(logging.DEBUG, logger="predict_rlm")
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=5,
+            debug=True,
+            verbose=False,
+        )
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('model authored')"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        seen: dict[str, str] = {}
+
+        class Repl:
+            def execute(self, code, variables=None):
+                from predict_rlm._logging import live_tool_call_logging_enabled
+
+                seen["before_execute"] = capsys.readouterr().err
+                assert live_tool_call_logging_enabled() is False
+                return "visible output"
+
+        with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+            rlm._execute_iteration(
+                repl=Repl(),
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
+
+        stderr = seen["before_execute"] + capsys.readouterr().err
+        assert "RLM turn" not in stderr
+        assert "reasoning:" not in stderr
+        assert "code:" not in stderr
+        assert "output:" not in stderr
+        events = [record.getMessage().split()[0] for record in caplog.records]
+        assert "rlm.action_generation.start" in events
+        assert "rlm.action_generation.ok" in events
+        assert "rlm.execute.start" in events
+        assert "rlm.execute.ok" in events
 
 
 class TestPredictTool:
@@ -647,6 +956,48 @@ class TestPredictRLMConfiguration:
         assert "predict" in instructions
         assert "llm_query" not in instructions
         assert "sub_lm_query" not in instructions
+
+    def test_action_instructions_omit_timeout_guidance_by_default(self):
+        """Model-chosen execution timeouts are off by default: no field, no prompt."""
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=None, max_iterations=5)
+        action = rlm.generate_action.signature
+        instructions = " ".join(str(action.instructions).split())
+        assert "execution_timeout_seconds" not in action.output_fields
+        assert "execution_timeout_seconds" not in instructions
+        assert "Execution timeouts" not in instructions
+
+    def test_action_instructions_steer_iteration_execution_timeout(self):
+        """With model_execution_timeout=True the prompt explains when/how to use timeouts."""
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=None,
+            max_iterations=5,
+            model_execution_timeout=True,
+        )
+        instructions = " ".join(str(rlm.generate_action.signature.instructions).split())
+
+        assert "execution_timeout_seconds" in instructions
+        assert "For every iteration" in instructions
+        assert "Use `null` for ordinary short, safe blocks" in instructions
+        assert "loops" in instructions
+        assert "scans over many files/items" in instructions
+        assert "network or tool fanout" in instructions
+        assert "batch `predict()` calls" in instructions
+        assert "tests/subprocesses" in instructions
+        assert "~1-5 seconds" in instructions
+        assert "~10-60 seconds" in instructions
+        assert "stdout/stderr printed before the timeout are preserved" in instructions
+        assert "next iteration can continue" in instructions
+        assert "store important partial results in variables" in instructions
+        assert "Strongly avoid long blocking calls" not in instructions
+        assert "Some operations may not be interruptible" not in instructions
+        assert "outside the Python event loop" not in instructions
+        assert "run bounded probes first" not in instructions
+        assert "scale up only after you understand the cost" not in instructions
+        assert "Prefer staged verification" not in instructions
+        assert "large SQLite queries" not in instructions
+        assert "`fetchall()` over unknown result sizes" not in instructions
+        assert "Do not run a full baseline query" not in instructions
 
     def test_allowed_domains_passed_to_interpreter(self):
         """PredictRLM passes allowed_domains to interpreter."""
@@ -1292,6 +1643,43 @@ class TestModelsFromSchema:
         assert instance.items == ["a", "b"]
         assert instance.counts == [1, 2, 3]
 
+    def test_defaulted_fields_stay_non_nullable(self):
+        """Not-required fields must round-trip as omittable, NOT nullable.
+
+        A field with a default (`mandatory: bool = True`) or a default_factory
+        (`tags: list[str]`) is "not required" in JSON Schema, but it is not
+        nullable. The reconstruction must keep the declared type (so the LM is told
+        the field is e.g. a list, never null) and preserve/restore the default --
+        otherwise the LM emits null and the user's original model rejects it.
+        Regression for the predict() schema round-trip bug.
+        """
+        from typing import List, Optional
+
+        class Item(BaseModel):
+            name: str  # required
+            note: Optional[str] = None  # genuinely nullable
+            mandatory: bool = True  # default value
+            tags: list[str] = Field(default_factory=list)  # default_factory
+
+        Model = _models_from_schema(Item.model_json_schema())["Item"]
+        fields = Model.model_fields
+
+        # Genuinely-nullable field stays Optional; defaulted ones do NOT become Optional.
+        assert fields["note"].annotation == Optional[str]
+        assert fields["mandatory"].annotation is bool
+        assert fields["tags"].annotation == List[str]
+
+        # Defaults are preserved / restored.
+        assert Model(name="x").mandatory is True
+        assert Model(name="x").tags == []
+
+        # The reconstructed model REJECTS null for the non-nullable defaulted fields
+        # (i.e. the LM will not be told null is acceptable).
+        with pytest.raises(ValidationError):
+            Model(name="x", tags=None)
+        with pytest.raises(ValidationError):
+            Model(name="x", mandatory=None)
+
     def test_nested_model_from_schema(self):
         """Nested models with $defs are reconstructed correctly."""
 
@@ -1794,8 +2182,263 @@ class TestUnresolvedTypesFallback:
                 assert isinstance(sig_arg, str)
 
 
+class TestSubmitConfirmation:
+    """Tests for configurable submit confirmation in the main RLM loop."""
+
+    @staticmethod
+    def _prediction(code: str, reasoning: str = "thinking") -> dspy.Prediction:
+        return dspy.Prediction(reasoning=reasoning, code=code)
+
+    def _run_sync(
+        self,
+        rlm: PredictRLM,
+        actions: list[dspy.Prediction],
+        repl: FakeSubmitRepl | None = None,
+    ) -> dspy.Prediction:
+        repl = repl or FakeSubmitRepl()
+        mock_lm = MagicMock()
+        mock_lm.history = []
+        rlm.generate_action = MagicMock(side_effect=actions)
+
+        with (
+            dspy.context(lm=mock_lm),
+            patch.object(rlm, "_interpreter_context", return_value=FakeInterpreterContext(repl)),
+        ):
+            return rlm._forward_traced(None, images=["img"], query="Original task")
+
+    async def _run_async(
+        self,
+        rlm: PredictRLM,
+        actions: list[dspy.Prediction],
+        repl: FakeSubmitRepl | None = None,
+    ) -> dspy.Prediction:
+        repl = repl or FakeSubmitRepl()
+        mock_lm = MagicMock()
+        mock_lm.history = []
+        rlm.generate_action = MagicMock()
+        rlm.generate_action.acall = AsyncMock(side_effect=actions)
+
+        with (
+            dspy.context(lm=mock_lm),
+            patch.object(rlm, "_interpreter_context", return_value=FakeInterpreterContext(repl)),
+        ):
+            return await rlm._aforward_traced(None, images=["img"], query="Original task")
+
+    def test_default_submit_completes_immediately(self):
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=MagicMock(), max_iterations=3)
+
+        result = self._run_sync(
+            rlm,
+            [self._prediction("SUBMIT(answer='done')")],
+        )
+
+        assert result.answer == "done"
+        assert result.trace.status == "completed"
+        assert len(result.trace.steps) == 1
+        assert rlm.generate_action.call_count == 1
+
+    def test_max_output_chars_controls_traced_history_and_step_output(self):
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=2,
+            max_output_chars=12,
+        )
+        long_output = "abcdefghijklmnopqrstuvwxyz"
+
+        class LongOutputRepl(FakeSubmitRepl):
+            def execute(self, code, variables=None, timeout=None):
+                self.executed.append(code)
+                if code.startswith("SUBMIT"):
+                    return FinalOutput(self.final_payload)
+                return long_output
+
+        result = self._run_sync(
+            rlm,
+            [
+                self._prediction("print('long')"),
+                self._prediction("SUBMIT(answer='done')"),
+            ],
+            repl=LongOutputRepl(),
+        )
+
+        second_call_history = rlm.generate_action.call_args_list[1].kwargs["repl_history"]
+        formatted_history = second_call_history.format()
+        assert "Output (26 chars):" in formatted_history
+        assert "abcdefghijkl" not in formatted_history
+        assert "... (14 characters omitted) ..." in formatted_history
+
+        first_step = result.trace.steps[0]
+        assert first_step.untruncated_output == long_output
+        assert first_step.output == "abcdefghijkl\n... (truncated to 12/26 chars)"
+
+    def test_first_submit_prompts_and_second_submit_completes(self):
+        seen_contexts = []
+
+        def confirm(context):
+            seen_contexts.append(context)
+            return "Please verify the answer before final submit."
+
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=3,
+            submit_confirmation=confirm,
+        )
+
+        repl = FakeSubmitRepl()
+        result = self._run_sync(
+            rlm,
+            [
+                self._prediction("SUBMIT(answer='done')", reasoning="first submit"),
+                self._prediction("SUBMIT(answer='done')", reasoning="second submit"),
+            ],
+            repl=repl,
+        )
+
+        assert result.answer == "done"
+        assert result.trace.status == "completed"
+        assert [step.output for step in result.trace.steps] == [
+            "Please verify the answer before final submit.",
+            "FINAL: {'answer': 'done'}",
+        ]
+        assert rlm.generate_action.call_count == 2
+        assert repl.deferred_submit_count == 1
+        assert len(seen_contexts) == 1
+        context = seen_contexts[0]
+        assert context.inputs == {"images": ["img"], "query": "Original task"}
+        assert context.output_field_names == ("answer",)
+        assert context.submitted_payload == {"answer": "done"}
+        assert context.prediction.answer == "done"
+        assert context.reasoning == "first submit"
+        assert context.code == "SUBMIT(answer='done')"
+        assert context.iteration == 1
+        assert "FINAL" in context.latest_observation
+        assert len(context.history.entries) == 1
+
+    def test_confirmation_callback_can_skip_with_none_or_empty_string(self):
+        callbacks = [lambda _context: None, lambda _context: ""]
+
+        for callback in callbacks:
+            rlm = PredictRLM(
+                ImageAnalysisSignature,
+                sub_lm=MagicMock(),
+                max_iterations=3,
+                submit_confirmation=callback,
+            )
+
+            result = self._run_sync(
+                rlm,
+                [self._prediction("SUBMIT(answer='done')")],
+            )
+
+            assert result.answer == "done"
+            assert result.trace.status == "completed"
+            assert len(result.trace.steps) == 1
+            assert rlm.generate_action.call_count == 1
+
+    def test_non_submit_after_confirmation_clears_pending_confirmation(self):
+        prompts = []
+
+        def confirm(context):
+            prompts.append(context.iteration)
+            return f"confirm attempt {context.iteration}"
+
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=5,
+            submit_confirmation=confirm,
+        )
+
+        result = self._run_sync(
+            rlm,
+            [
+                self._prediction("SUBMIT(answer='done')"),
+                self._prediction("print('checking')"),
+                self._prediction("SUBMIT(answer='done')"),
+                self._prediction("SUBMIT(answer='done')"),
+            ],
+        )
+
+        assert result.answer == "done"
+        assert prompts == [1, 3]
+        assert [step.output for step in result.trace.steps] == [
+            "confirm attempt 1",
+            "checked output",
+            "confirm attempt 3",
+            "FINAL: {'answer': 'done'}",
+        ]
+        assert rlm.generate_action.call_count == 4
+
+    @pytest.mark.asyncio
+    async def test_async_submit_confirmation_matches_sync_path(self):
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=MagicMock(),
+            max_iterations=3,
+            submit_confirmation=lambda _context: "async confirm",
+        )
+
+        result = await self._run_async(
+            rlm,
+            [
+                self._prediction("SUBMIT(answer='done')"),
+                self._prediction("SUBMIT(answer='done')"),
+            ],
+        )
+
+        assert result.answer == "done"
+        assert result.trace.status == "completed"
+        assert [step.output for step in result.trace.steps] == [
+            "async confirm",
+            "FINAL: {'answer': 'done'}",
+        ]
+        assert rlm.generate_action.acall.call_count == 2
+
+
 class TestExecuteIteration:
     """Tests for _execute_iteration sync-path behavior."""
+
+    def test_action_lm_trace_metadata_stays_compact_with_prompt_cache_stats(self):
+        mock_lm = MagicMock()
+        mock_lm.history = []
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.execute = MagicMock(return_value="output from execute")
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('hello')"
+
+        def generate_action(**_kwargs):
+            mock_lm.history.append(
+                {
+                    "usage": {
+                        "prompt_tokens": 2000,
+                        "completion_tokens": 100,
+                        "prompt_tokens_details": {"cached_tokens": 1536},
+                    },
+                    "response": {"choices": [{"finish_reason": "stop"}]},
+                }
+            )
+            return mock_pred
+
+        rlm.generate_action = MagicMock(side_effect=generate_action)
+
+        with dspy.context(lm=mock_lm):
+            with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+                rlm._execute_iteration(
+                    repl=mock_repl,
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+
+        assert rlm._last_action_lm_metadata == LMFinishMetadata(finish_reason="stop")
 
     def test_accepts_repl_fence_in_sync_path(self):
         mock_lm = MagicMock()
@@ -1823,8 +2466,56 @@ class TestExecuteIteration:
         mock_repl.execute.assert_called_once_with("print('hello')", variables={})
         assert result is mock_result
 
+    def test_verbose_streams_reasoning_and_code_before_sync_execute(self, capsys):
+        mock_lm = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=mock_lm,
+            max_iterations=5,
+            verbose=True,
+        )
+
+        mock_repl = MagicMock()
+        seen: dict[str, str] = {}
+
+        def execute(code, variables=None):
+            seen["before_execute"] = capsys.readouterr().err
+            return "output from execute"
+
+        mock_repl.execute = MagicMock(side_effect=execute)
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "```python\nprint('model authored')\n```"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+            rlm._execute_iteration(
+                repl=mock_repl,
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={"internal": "host value"},
+                output_field_names=["answer"],
+            )
+
+        before_execute = seen["before_execute"]
+        after_execute = capsys.readouterr().err
+        before_text = _strip_ansi(before_execute)
+        after_text = _strip_ansi(after_execute)
+        _assert_raw_verbose_output(before_execute)
+        _assert_raw_verbose_output(after_execute)
+        assert "RLM turn 1/5" in before_text
+        assert "reasoning:" in before_text
+        assert "thinking" in before_text
+        assert "code:" in before_text
+        assert "model authored" in before_text
+        assert "output:" not in before_text
+        assert "output:" in after_text
+        assert "output from execute" in after_text
+
     def test_sync_sandbox_fatal_error_propagates(self):
-        from predict_rlm.interpreter import SandboxFatalError
+        from predict_rlm.backends.base import SandboxFatalError
 
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -1847,6 +2538,43 @@ class TestExecuteIteration:
                 output_field_names=["answer"],
             )
 
+    def test_failed_iteration_preserves_partial_output_before_error(self):
+        from predict_rlm.backends.base import SandboxExecutionError
+
+        mock_lm = MagicMock()
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.execute = MagicMock(
+            side_effect=SandboxExecutionError(
+                "ValueError: bad",
+                partial_output="before failure\n",
+            )
+        )
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('before failure')\nraise ValueError('bad')"
+        rlm.generate_action = MagicMock(return_value=mock_pred)
+
+        captured: dict[str, str] = {}
+
+        def process_result(*args):
+            captured["result"] = args[2] if len(args) == 5 else args[1]
+            return MagicMock()
+
+        with patch.object(rlm, "_process_execution_result", side_effect=process_result):
+            rlm._execute_iteration(
+                repl=mock_repl,
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={},
+                output_field_names=["answer"],
+            )
+
+        assert captured["result"] == "before failure\n[Error] ValueError: bad"
+
 
 class TestPredictRLMTelemetry:
     """Focused generated-code telemetry tests without real LM calls."""
@@ -1861,18 +2589,18 @@ class TestPredictRLMTelemetry:
         )
         created_kwargs = {}
 
-        class FakeJspiInterpreter:
+        class FakeJspiBackend:
             def __init__(self, **kwargs):
                 created_kwargs.update(kwargs)
 
             def shutdown(self):
                 created_kwargs["shutdown_called"] = True
 
-        with patch("predict_rlm.predict_rlm.JspiInterpreter", FakeJspiInterpreter):
+        with patch("predict_rlm.predict_rlm.JspiBackend", FakeJspiBackend):
             rlm._begin_telemetry_execution()
             try:
                 with rlm._interpreter_context(execution_tools={}) as repl:
-                    assert isinstance(repl, FakeJspiInterpreter)
+                    assert isinstance(repl, FakeJspiBackend)
             finally:
                 rlm._clear_telemetry_execution()
 
@@ -2044,6 +2772,48 @@ class TestAexecuteIteration:
     """Tests for _aexecute_iteration: async vs sync interpreter dispatch."""
 
     @pytest.mark.asyncio
+    async def test_async_action_lm_trace_metadata_stays_compact_with_prompt_cache_stats(self):
+        mock_lm = MagicMock()
+        mock_lm.history = []
+        rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
+
+        mock_repl = MagicMock()
+        mock_repl.aexecute = AsyncMock(return_value="output from aexecute")
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "print('hello')"
+
+        async def generate_action(**_kwargs):
+            mock_lm.history.append(
+                {
+                    "usage": {
+                        "prompt_tokens": 2000,
+                        "completion_tokens": 100,
+                        "prompt_tokens_details": {"cached_tokens": 1536},
+                    },
+                    "response": {"choices": [{"finish_reason": "stop"}]},
+                }
+            )
+            return mock_pred
+
+        rlm.generate_action = MagicMock()
+        rlm.generate_action.acall = AsyncMock(side_effect=generate_action)
+
+        with dspy.context(lm=mock_lm):
+            with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+                await rlm._aexecute_iteration(
+                    repl=mock_repl,
+                    variables=[],
+                    history=[],
+                    iteration=0,
+                    input_args={},
+                    output_field_names=["answer"],
+                )
+
+        assert rlm._last_action_lm_metadata == LMFinishMetadata(finish_reason="stop")
+
+    @pytest.mark.asyncio
     async def test_uses_aexecute_when_available(self):
         """_aexecute_iteration calls repl.aexecute() when it has the method."""
         mock_lm = MagicMock()
@@ -2064,7 +2834,7 @@ class TestAexecuteIteration:
             rlm, "_process_execution_result", return_value=mock_result
         ) as mock_process:
             with patch(
-                "predict_rlm.predict_rlm._strip_code_fences", return_value="print('hello')"
+                "predict_rlm.predict_rlm.strip_code_fences", return_value="print('hello')"
             ):
                 result = await rlm._aexecute_iteration(
                     repl=mock_repl,
@@ -2089,6 +2859,57 @@ class TestAexecuteIteration:
             )
 
     @pytest.mark.asyncio
+    async def test_verbose_streams_reasoning_and_code_before_async_execute(self, capsys):
+        mock_lm = MagicMock()
+        rlm = PredictRLM(
+            ImageAnalysisSignature,
+            sub_lm=mock_lm,
+            max_iterations=5,
+            verbose=True,
+        )
+
+        mock_repl = MagicMock()
+        seen: dict[str, str] = {}
+
+        async def aexecute(code, variables=None):
+            seen["before_execute"] = capsys.readouterr().err
+            return "output from aexecute"
+
+        mock_repl.aexecute = AsyncMock(side_effect=aexecute)
+
+        mock_pred = MagicMock()
+        mock_pred.reasoning = "thinking"
+        mock_pred.code = "```python\nprint('async model authored')\n```"
+
+        rlm.generate_action = MagicMock()
+        rlm.generate_action.acall = AsyncMock(return_value=mock_pred)
+
+        with patch.object(rlm, "_process_execution_result", return_value=MagicMock()):
+            await rlm._aexecute_iteration(
+                repl=mock_repl,
+                variables=[],
+                history=[],
+                iteration=0,
+                input_args={"internal": "host value"},
+                output_field_names=["answer"],
+            )
+
+        before_execute = seen["before_execute"]
+        after_execute = capsys.readouterr().err
+        before_text = _strip_ansi(before_execute)
+        after_text = _strip_ansi(after_execute)
+        _assert_raw_verbose_output(before_execute)
+        _assert_raw_verbose_output(after_execute)
+        assert "RLM turn 1/5" in before_text
+        assert "reasoning:" in before_text
+        assert "thinking" in before_text
+        assert "code:" in before_text
+        assert "async model authored" in before_text
+        assert "output:" not in before_text
+        assert "output:" in after_text
+        assert "output from aexecute" in after_text
+
+    @pytest.mark.asyncio
     async def test_falls_back_to_execute_when_no_aexecute(self):
         """_aexecute_iteration falls back to repl.execute() when aexecute is absent."""
         mock_lm = MagicMock()
@@ -2107,7 +2928,7 @@ class TestAexecuteIteration:
         mock_result = MagicMock()
         with patch.object(rlm, "_process_execution_result", return_value=mock_result):
             with patch(
-                "predict_rlm.predict_rlm._strip_code_fences", return_value="print('hi')"
+                "predict_rlm.predict_rlm.strip_code_fences", return_value="print('hi')"
             ):
                 result = await rlm._aexecute_iteration(
                     repl=mock_repl,
@@ -2141,7 +2962,7 @@ class TestAexecuteIteration:
         with patch.object(
             rlm, "_process_execution_result", return_value=mock_result
         ) as mock_process:
-            with patch("predict_rlm.predict_rlm._strip_code_fences", return_value="bad_code()"):
+            with patch("predict_rlm.predict_rlm.strip_code_fences", return_value="bad_code()"):
                 await rlm._aexecute_iteration(
                     repl=mock_repl,
                     variables=[],
@@ -2159,7 +2980,7 @@ class TestAexecuteIteration:
 
     @pytest.mark.asyncio
     async def test_sandbox_fatal_error_propagates(self):
-        from predict_rlm.interpreter import SandboxFatalError
+        from predict_rlm.backends.base import SandboxFatalError
 
         mock_lm = MagicMock()
         rlm = PredictRLM(ImageAnalysisSignature, sub_lm=mock_lm, max_iterations=5)
@@ -2215,6 +3036,28 @@ class TestAforwardTracedUsage:
         assert u.input_tokens == 290
         assert u.output_tokens == 85
         assert u.cost == pytest.approx(0.0031)
+
+    def test_debug_lm_metadata_reports_openai_prompt_cache_hits(self):
+        mock_lm = MagicMock()
+        mock_lm.history = [
+            {
+                "usage": {
+                    "prompt_tokens": 2000,
+                    "completion_tokens": 100,
+                    "prompt_tokens_details": {"cached_tokens": 1536},
+                },
+                "response": {"choices": [{"finish_reason": "stop"}]},
+            }
+        ]
+        metadata = lm_completion_metadata_since(mock_lm, 0)
+        rlm = PredictRLM.__new__(PredictRLM)
+
+        attrs = rlm._debug_lm_metadata(metadata)
+
+        assert attrs["lm_prompt_tokens"] == 2000
+        assert attrs["lm_cached_prompt_tokens"] == 1536
+        assert attrs["lm_prompt_cache_read_ratio"] == pytest.approx(1536 / 2000)
+        assert attrs["lm_output_tokens"] == 100
 
 
 class TestSkillsMergeIntoInit:

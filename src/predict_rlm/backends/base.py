@@ -1,0 +1,609 @@
+"""Shared execution backend types."""
+
+from __future__ import annotations
+
+import asyncio
+import contextvars
+import json
+import threading
+import time
+from abc import ABC, abstractmethod
+from contextlib import asynccontextmanager, contextmanager
+from enum import Enum
+from typing import Any, Protocol
+
+from dspy.primitives.code_interpreter import CodeInterpreterError, FinalOutput
+
+from predict_rlm.execution_timeout import format_recoverable_timeout_result
+
+STALE_RESPONSE_DISCARD_LIMIT = 50
+
+
+class SandboxFatalError(RuntimeError):
+    """Raised when the sandbox subprocess dies and the run cannot continue.
+
+    This is deliberately not a ``CodeInterpreterError``. Ordinary in-sandbox
+    Python failures should be fed back to the RLM as observations, but
+    sandbox-level failures mean the runtime state and setup may be gone.
+    """
+
+_TOOL_CALLBACK_GATES: contextvars.ContextVar[frozenset[int]] = (
+    contextvars.ContextVar("_TOOL_CALLBACK_GATES", default=frozenset())
+)
+_THREAD_LOCAL_TOOL_CALLBACKS = threading.local()
+
+
+class BackendExecutionGate:
+    """Serialize top-level backend execution and reject tool reentry."""
+
+    def __init__(self, interpreter_name: str) -> None:
+        self._interpreter_name = interpreter_name
+        self._condition = threading.Condition()
+        self._running = False
+
+    @contextmanager
+    def top_level(self):
+        self._raise_if_in_tool_callback()
+        self._acquire()
+        try:
+            yield
+        finally:
+            self._release()
+
+    @asynccontextmanager
+    async def atop_level(self):
+        self._raise_if_in_tool_callback()
+        await self._acquire_async()
+        try:
+            yield
+        finally:
+            self._release()
+
+    @contextmanager
+    def tool_callback(self):
+        token = self._enter_contextvar_tool_callback()
+        stack = getattr(_THREAD_LOCAL_TOOL_CALLBACKS, "stack", ())
+        _THREAD_LOCAL_TOOL_CALLBACKS.stack = (*stack, id(self))
+        try:
+            yield
+        finally:
+            _THREAD_LOCAL_TOOL_CALLBACKS.stack = stack
+            _TOOL_CALLBACK_GATES.reset(token)
+
+    @contextmanager
+    def async_tool_callback(self):
+        token = self._enter_contextvar_tool_callback()
+        try:
+            yield
+        finally:
+            _TOOL_CALLBACK_GATES.reset(token)
+
+    def is_running(self) -> bool:
+        """Whether a top-level execution currently holds the gate."""
+        with self._condition:
+            return self._running
+
+    def wait_until_idle(self, timeout: float | None = None) -> bool:
+        """Block until no top-level execution holds the gate.
+
+        Returns ``True`` once the gate is idle, or ``False`` if ``timeout``
+        elapsed first. Callers must be on a different thread than the one
+        holding the gate (the executing worker), otherwise this deadlocks.
+        """
+        with self._condition:
+            return self._condition.wait_for(lambda: not self._running, timeout)
+
+    def _acquire(self) -> None:
+        with self._condition:
+            while self._running:
+                self._condition.wait()
+            self._running = True
+
+    async def _acquire_async(self) -> None:
+        while True:
+            with self._condition:
+                if not self._running:
+                    self._running = True
+                    return
+            await asyncio.sleep(0.01)
+
+    def _release(self) -> None:
+        with self._condition:
+            self._running = False
+            self._condition.notify_all()
+
+    def _raise_if_in_tool_callback(self) -> None:
+        gate_id = id(self)
+        if gate_id in _TOOL_CALLBACK_GATES.get():
+            raise RuntimeError(self._tool_reentry_message())
+        if gate_id in getattr(_THREAD_LOCAL_TOOL_CALLBACKS, "stack", ()):
+            raise RuntimeError(self._tool_reentry_message())
+
+    def _enter_contextvar_tool_callback(self) -> contextvars.Token[frozenset[int]]:
+        gates = _TOOL_CALLBACK_GATES.get()
+        return _TOOL_CALLBACK_GATES.set(gates | {id(self)})
+
+    def _tool_reentry_message(self) -> str:
+        return (
+            f"Cannot call execute/aexecute on the same {self._interpreter_name} "
+            "from a host tool callback"
+        )
+
+
+class BackendName(str, Enum):
+    """Named sandbox backends supported by PredictRLM."""
+
+    JSPI = "jspi"
+    SBX = "sbx"
+
+
+class SandboxExecutionError(CodeInterpreterError):
+    """Recoverable sandbox code error with captured output before failure."""
+
+    def __init__(self, message: str, *, partial_output: str = "") -> None:
+        super().__init__(message)
+        self.error_message = message
+        self.partial_output = partial_output
+
+    def __str__(self) -> str:
+        if not self.partial_output:
+            return self.error_message
+        return f"{self.partial_output.rstrip()}\n{self.error_message}"
+
+
+class ExecutionBackend(Protocol):
+    """Runtime methods PredictRLM needs from an interpreter backend."""
+
+    def execute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any: ...
+
+    async def aexecute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any: ...
+
+    def mount_file_at(self, host_path: str, virtual_path: str) -> None: ...
+
+    def mkdir_p(self, virtual_path: str) -> None: ...
+
+    def list_dir(self, virtual_path: str) -> list[str]: ...
+
+    def sync_file_to(self, virtual_path: str, host_path: str) -> None: ...
+
+    def shutdown(self) -> None: ...
+
+
+LegacyExecutionBackend = ExecutionBackend
+
+
+class SupervisorProcess(Protocol):
+    """Process-like object used by supervisor clients."""
+
+    stdin: Any
+    stdout: Any
+    stderr: Any
+
+    def poll(self) -> int | None: ...
+
+
+class SupervisorClient(ABC):
+    """Shared JSON-RPC client for Python supervisors.
+
+    Backend subclasses own process creation, tool callbacks, file semantics,
+    timeout policy, and user-facing diagnostics. This class owns request IDs,
+    JSON-RPC framing, response resync, and structured-response lifecycle state.
+    """
+
+    def __init__(
+        self,
+        *,
+        supervisor_name: str | None = None,
+        runner_name: str | None = None,
+        stale_response_discard_limit: int = STALE_RESPONSE_DISCARD_LIMIT,
+    ) -> None:
+        self._persistent_supervisor_name = supervisor_name or runner_name
+        if self._persistent_supervisor_name is None:
+            raise TypeError("supervisor_name is required")
+        self._stale_response_discard_limit = stale_response_discard_limit
+        self._request_id = 0
+        self._supervisor_exit_recovery_context: dict[str, Any] | None = None
+
+    def _send_json_rpc_request(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        recovered = self._recover_dead_supervisor_after_structured_execute(method)
+        if recovered is not None:
+            return recovered
+        self._ensure_process_for_request(method)
+        return self._send_json_rpc_request_without_ensure(
+            method,
+            params,
+            timeout=timeout,
+        )
+
+    def _send_json_rpc_request_without_ensure(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        params = params or {}
+        process = self._require_supervisor_process()
+        request_timeout = self._request_timeout_seconds(method, params, timeout)
+        request_id = self._next_request_id()
+        payload = {
+            "jsonrpc": "2.0",
+            "method": method,
+            "params": params,
+            "id": request_id,
+        }
+        try:
+            process.stdin.write(self._serialize_supervisor_message(payload) + "\n")
+            process.stdin.flush()
+        except BrokenPipeError as exc:
+            self._handle_supervisor_send_error(method, request_id, exc)
+
+        deadline = time.monotonic() + request_timeout
+        request_start = time.perf_counter()
+        stale_discards = 0
+        stdout_tail: list[str] = []
+        self._on_supervisor_request_start(
+            method,
+            params,
+            request_id=request_id,
+            request_timeout=request_timeout,
+        )
+        while True:
+            self._drain_completed_supervisor_work()
+            if process.poll() is not None:
+                self._handle_supervisor_exit_during_request(
+                    method,
+                    request_id=request_id,
+                    request_start=request_start,
+                    process=process,
+                )
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return self._handle_supervisor_request_timeout(
+                    method,
+                    params,
+                    process,
+                    request_id=request_id,
+                    request_timeout=request_timeout,
+                    request_start=request_start,
+                    stdout_tail="".join(stdout_tail)[-4000:],
+                )
+
+            line = self._read_supervisor_stdout_line(
+                process,
+                deadline=deadline,
+                timeout=remaining,
+            )
+            if line is None:
+                return self._handle_supervisor_request_timeout(
+                    method,
+                    params,
+                    process,
+                    request_id=request_id,
+                    request_timeout=request_timeout,
+                    request_start=request_start,
+                    stdout_tail="".join(stdout_tail)[-4000:],
+                )
+            if not line:
+                continue
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError:
+                stdout_tail.append(line)
+                continue
+            if not isinstance(message, dict):
+                stdout_tail.append(line)
+                continue
+            if self._handle_supervisor_control_message(message, deadline=deadline):
+                continue
+            if message.get("id") == request_id:
+                self._record_supervisor_response(
+                    method,
+                    params,
+                    request_id=request_id,
+                    request_timeout=request_timeout,
+                    response=message,
+                )
+                self._on_supervisor_request_response(
+                    method,
+                    request_id=request_id,
+                    request_start=request_start,
+                    response=message,
+                )
+                return message
+            self._on_supervisor_stale_response(
+                method,
+                expected_request_id=request_id,
+                stale_response=message,
+                stale_discards=stale_discards + 1,
+            )
+            stale_discards += 1
+            if stale_discards > self._stale_response_discard_limit:
+                self._handle_stale_response_limit(
+                    method,
+                    request_id=request_id,
+                    request_start=request_start,
+                )
+
+    def _next_request_id(self) -> int:
+        self._request_id += 1
+        return self._request_id
+
+    def _require_supervisor_process(self) -> SupervisorProcess:
+        process = self._get_supervisor_process()
+        if process is None:
+            raise SandboxFatalError(f"{self._persistent_supervisor_name} is not started")
+        if process.stdin is None or process.stdout is None:
+            raise SandboxFatalError(f"{self._persistent_supervisor_name} stdio is unavailable")
+        return process
+
+    def _record_supervisor_response(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        request_id: int,
+        request_timeout: float,
+        response: dict[str, Any],
+    ) -> None:
+        if method != "execute":
+            return
+        response_kind = self._execute_response_kind(response)
+        if response_kind not in {"structured_error", "structured_timeout"}:
+            self._supervisor_exit_recovery_context = None
+            return
+        self._supervisor_exit_recovery_context = {
+            "request_id": request_id,
+            "method": method,
+            "response_kind": response_kind,
+            "execution_timeout_seconds": params.get("execution_timeout_seconds"),
+            "request_timeout": request_timeout,
+        }
+
+    def _execute_response_kind(self, response: dict[str, Any]) -> str:
+        if "error" in response:
+            return "structured_error"
+        result = response.get("result") or {}
+        if isinstance(result, dict) and "timeout" in result:
+            return "structured_timeout"
+        return "ok"
+
+    def _recover_dead_supervisor_after_structured_execute(
+        self,
+        method: str,
+    ) -> dict[str, Any] | None:
+        if method != "execute" or self._supervisor_exit_recovery_context is None:
+            return None
+        process = self._get_supervisor_process()
+        if process is None:
+            return None
+        returncode = process.poll()
+        if returncode is None:
+            return None
+
+        stderr = self._read_stderr_for_process(process)
+        context = self._supervisor_exit_recovery_context
+        self._supervisor_exit_recovery_context = None
+        self._discard_supervisor_process()
+        restart_error: BaseException | None = None
+        try:
+            self._ensure_process_for_request(method)
+        except BaseException as exc:
+            restart_error = exc
+        if restart_error is not None:
+            raise SandboxFatalError(
+                f"{self._persistent_supervisor_name} exited after the previous execute "
+                "response and could not be restarted: "
+                f"{restart_error}. {self._format_supervisor_exit_evidence(returncode, context)}"
+            ) from restart_error
+
+        return {
+            "jsonrpc": "2.0",
+            "id": self._next_request_id(),
+            "result": {
+                "output": self._format_supervisor_restart_diagnostic(
+                    returncode,
+                    context,
+                    stderr=stderr,
+                )
+            },
+        }
+
+    def _format_supervisor_exit_evidence(
+        self,
+        returncode: int | None,
+        context: dict[str, Any],
+    ) -> str:
+        parts = [
+            f"supervisor_returncode={returncode}",
+            f"previous_request_id={context.get('request_id')}",
+            f"previous_method={context.get('method')}",
+            f"previous_response={context.get('response_kind')}",
+        ]
+        execution_timeout = context.get("execution_timeout_seconds")
+        if execution_timeout is not None:
+            parts.append(
+                "previous_execution_timeout_seconds="
+                f"{self._format_number(execution_timeout)}"
+            )
+        request_timeout = context.get("request_timeout")
+        if request_timeout is not None:
+            parts.append(
+                f"previous_host_timeout_seconds={self._format_number(request_timeout)}"
+            )
+        return " ".join(parts)
+
+    def _format_number(self, value: Any) -> str:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return f"{float(value):g}"
+        return str(value)
+
+    def _unwrap_execute_response(self, response: dict[str, Any]) -> Any:
+        if "error" in response:
+            self._raise_execute_error(response)
+        result = response.get("result") or {}
+        if isinstance(result, dict) and "timeout" in result:
+            return format_recoverable_timeout_result(result)
+        if "final" in result:
+            return FinalOutput(result["final"])
+        if "submitted" in result:
+            return FinalOutput(result["submitted"])
+        return result.get("output")
+
+    def _serialize_supervisor_message(self, message: dict[str, Any]) -> str:
+        return json.dumps(message)
+
+    def _drain_completed_supervisor_work(self) -> None:
+        return None
+
+    def _handle_supervisor_control_message(
+        self,
+        message: dict[str, Any],
+        *,
+        deadline: float,
+    ) -> bool:
+        return False
+
+    def _on_supervisor_request_start(
+        self,
+        method: str,
+        params: dict[str, Any],
+        *,
+        request_id: int,
+        request_timeout: float,
+    ) -> None:
+        return None
+
+    def _on_supervisor_request_response(
+        self,
+        method: str,
+        *,
+        request_id: int,
+        request_start: float,
+        response: dict[str, Any],
+    ) -> None:
+        return None
+
+    def _on_supervisor_stale_response(
+        self,
+        method: str,
+        *,
+        expected_request_id: int,
+        stale_response: dict[str, Any],
+        stale_discards: int,
+    ) -> None:
+        return None
+
+    def _handle_supervisor_send_error(
+        self,
+        method: str,
+        request_id: int,
+        exc: BrokenPipeError,
+    ) -> None:
+        raise SandboxFatalError(f"{self._persistent_supervisor_name} pipe broke") from exc
+
+    def _handle_supervisor_exit_during_request(
+        self,
+        method: str,
+        *,
+        request_id: int,
+        request_start: float,
+        process: SupervisorProcess,
+    ) -> None:
+        raise SandboxFatalError(
+            f"{self._persistent_supervisor_name} exited unexpectedly: "
+            f"{self._read_stderr_for_process(process)}"
+        )
+
+    def _handle_stale_response_limit(
+        self,
+        method: str,
+        *,
+        request_id: int,
+        request_start: float,
+    ) -> None:
+        raise CodeInterpreterError(
+            "Too many stale top-level responses while resyncing "
+            f"{self._persistent_supervisor_name} request id={request_id}"
+        )
+
+    @abstractmethod
+    def _get_supervisor_process(self) -> SupervisorProcess | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _ensure_process_for_request(self, method: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _request_timeout_seconds(
+        self,
+        method: str,
+        params: dict[str, Any],
+        timeout: float | None,
+    ) -> float:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _read_supervisor_stdout_line(
+        self,
+        process: SupervisorProcess,
+        *,
+        deadline: float,
+        timeout: float,
+    ) -> str | None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _handle_supervisor_request_timeout(
+        self,
+        method: str,
+        params: dict[str, Any],
+        process: SupervisorProcess,
+        *,
+        request_id: int,
+        request_timeout: float,
+        request_start: float,
+        stdout_tail: str,
+    ) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _discard_supervisor_process(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _read_stderr_for_process(self, process: SupervisorProcess) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _format_supervisor_restart_diagnostic(
+        self,
+        returncode: int | None,
+        context: dict[str, Any],
+        *,
+        stderr: str,
+    ) -> str:
+        raise NotImplementedError
+
+    @abstractmethod
+    def _raise_execute_error(self, response: dict[str, Any]) -> None:
+        raise NotImplementedError

@@ -1,7 +1,7 @@
 """RED-GREEN repro for the Response-ID desync bomb.
 
 Background:
-    ``JspiInterpreter._send_request`` increments ``self._request_id``,
+    ``JspiBackend._send_request`` increments ``self._request_id``,
     writes a JSON-RPC message to deno's stdin, then reads one line from
     stdout and asserts the response's ``id`` matches the request. If it
     doesn't, the helper raises ``Response ID mismatch``.
@@ -39,17 +39,22 @@ import types
 
 import pytest
 
-import predict_rlm.interpreter as rlm_interpreter
-from predict_rlm.interpreter import CodeInterpreterError, JspiInterpreter
-from predict_rlm.interpreters import SbxConfig, SbxInterpreter
-from predict_rlm.interpreters.base import STALE_RESPONSE_DISCARD_LIMIT
+pytest.importorskip("websockets")  # SBX/supervisor backend requires the [sbx] extra
+
+pytestmark = pytest.mark.sbx
+
+from dspy.primitives.code_interpreter import CodeInterpreterError  # noqa: E402
+
+import predict_rlm.backends.jspi.backend as rlm_interpreter  # noqa: E402
+from predict_rlm.backends import JspiBackend, SbxBackend, SbxConfig  # noqa: E402
+from predict_rlm.backends.base import STALE_RESPONSE_DISCARD_LIMIT  # noqa: E402
 
 
 def _build_interp(stdout_lines: list[str]):
-    """Build a JspiInterpreter whose ``_read_with_timeout`` is mocked
+    """Build a JspiBackend whose ``_read_with_timeout`` is mocked
     to pop from a scripted queue. Avoids real fd/select plumbing.
     """
-    interp = JspiInterpreter.__new__(JspiInterpreter)
+    interp = JspiBackend.__new__(JspiBackend)
     interp._stdout_fd = -1
     interp._read_buf = ""
     interp._use_jspi = False
@@ -162,10 +167,9 @@ def test_matching_response_passes_through_unchanged():
 
 
 def _build_execute_loop_interp(stdout_lines: list[str]):
-    interp = JspiInterpreter.__new__(JspiInterpreter)
+    interp = JspiBackend.__new__(JspiBackend)
     interp._pending_file_ops = {}
     interp._debug = False
-    interp._sync_files = lambda: None
     interp.deno_process = types.SimpleNamespace(
         stderr=types.SimpleNamespace(read=lambda: ""),
     )
@@ -179,6 +183,10 @@ def _build_execute_loop_interp(stdout_lines: list[str]):
     async def _noop_responses(pending):
         return None
 
+    async def _noop_sync_files():
+        return None
+
+    interp._async_files = _noop_sync_files  # type: ignore[assignment]
     interp._read_with_timeout_async = _mock_read  # type: ignore[assignment]
     interp._send_completed_responses = _noop_responses  # type: ignore[assignment]
     interp._wait_and_send_all_responses = _noop_responses  # type: ignore[assignment]
@@ -262,8 +270,8 @@ class _BufferingStdin:
         return None
 
 
-def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxInterpreter:
-    interp = SbxInterpreter(
+def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxBackend:
+    interp = SbxBackend(
         config=SbxConfig(name="resync-test", exec_timeout=1),
         preinstall_packages=False,
         _runner_command=["unused"],
@@ -282,9 +290,8 @@ def _build_sbx_request_interp(tmp_path, stdout_lines: list[str]) -> SbxInterpret
     return interp
 
 
-def _close_sbx_request_interp(interp: SbxInterpreter) -> None:
+def _close_sbx_request_interp(interp: SbxBackend) -> None:
     interp._proc = None
-    interp._tool_executor.shutdown(wait=False, cancel_futures=True)
 
 
 def test_sbx_send_request_discards_stale_top_level_response(tmp_path):

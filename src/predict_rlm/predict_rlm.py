@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import hashlib
 import inspect
 import logging
 import os
 import re
 import time
-import types
+import uuid
 from contextlib import asynccontextmanager, contextmanager
-from copy import deepcopy
-from dataclasses import dataclass, field
+from contextvars import ContextVar
+from copy import copy, deepcopy
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import (
     TYPE_CHECKING,
@@ -21,9 +24,11 @@ from typing import (
     Iterator,
     List,
     Literal,
+    Mapping,
     Optional,
-    get_args,
-    get_origin,
+    Protocol,
+    Sequence,
+    runtime_checkable,
 )
 
 import dspy
@@ -32,28 +37,82 @@ import regex
 from dspy.adapters.base import Adapter
 from dspy.adapters.chat_adapter import ChatAdapter
 from dspy.adapters.json_adapter import JSONAdapter
-from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterError
+from dspy.primitives.code_interpreter import CodeInterpreter, CodeInterpreterError, FinalOutput
 from dspy.utils.callback import ACTIVE_CALL_ID
 from dspy.utils.exceptions import AdapterParseError
 from litellm import ContextWindowExceededError
-from pydantic import ConfigDict, ValidationError, create_model
+from pydantic import ConfigDict, Field, ValidationError, create_model
 
-from ._shared import build_rlm_signatures, format_tool_docs_full
-from .files import File, build_file_plan, scan_file_fields
-from .interpreter import JspiInterpreter, SandboxFatalError
-from .interpreters import (
-    PredictRLMInterpreter,
-    SandboxBackend,
-    SbxConfig,
-    SbxInterpreter,
-    SbxPool,
+from ._logging import (
+    configure_predict_rlm_logging,
+    emit_trace_iteration_end,
+    emit_trace_iteration_output,
+    emit_trace_iteration_start,
+    emit_trace_iteration_submit,
+    format_log_fields,
+    live_tool_call_logging,
+    suppress_interpreter_result_logging,
 )
+from ._shared import build_rlm_signatures, format_tool_docs_full, strip_code_fences
+from .backends import (
+    BackendName,
+)
+from .backends.adapters import (
+    ExistingExecutionBackendAdapter,
+)
+from .backends.base import LegacyExecutionBackend, SandboxFatalError
+from .backends.jspi import JspiBackend
+from .compatibility import (
+    SyncedFileToolOperation,
+    ValueInputAdapter,
+    execution_from_options,
+)
+from .compatibility import (
+    files as file_compatibility,
+)
+from .evidence import EvidenceRecorder, RunEventKind
+from .execution_timeout import validate_execution_timeout
+from .files import File, build_file_plan, scan_file_fields
+from .in_context import CtxStrInputAdapter
 from .rlm_skills import Skill, merge_skills
+from .runtime import (
+    Artifact,
+    CallableTool,
+    EventSink,
+    ExecutionBackend,
+    ExecutionFatalError,
+    ExecutionResult,
+    ExecutionSpec,
+    FieldDescriptor,
+    InputAdapter,
+    OutputAdapter,
+    PreparedInputBinding,
+    RunContext,
+    RuntimeContribution,
+    RuntimeModule,
+    RuntimeSpec,
+    SessionRequirements,
+    compile_prepared_input,
+    current_run_context,
+    invoke_host_callable,
+    merge_session_requirements,
+    preserve_sync_leaf,
+    resolve_input_adapter,
+    resolve_output_adapter,
+    resolve_runtime_spec,
+    use_run_context,
+    validate_output_sandbox_root_reservation,
+    validate_sandbox_root_reservations,
+)
+from .runtime_hooks import RuntimeHook, RuntimeHookEvent
 from .telemetry import TelemetryContext, make_span_id
 from .trace import (
     IterationStep,
     LMUsage,
+    RunEvidence,
+    RunEvidenceEvent,
     RunTrace,
+    TokenUsage,
     _RawPredictCall,
     drain_predict_calls,
     drain_tool_calls,
@@ -86,28 +145,6 @@ DEFAULT_LM_TIMEOUT = 120
 
 
 @dataclass
-class _TracedRun:
-    """Per-invocation state for one traced (a)forward().
-
-    Everything here is LOCAL to a single call — never instance state — so
-    concurrent forwards on one PredictRLM (e.g. asyncio.gather over rollouts)
-    can't race on counters, snapshots, or the swapped-in signatures.
-    """
-
-    file_plan: dict[str, Any] | None
-    output_file_fields: dict[str, Any]
-    orig_action: Any
-    orig_extract: Any
-    run_start: float
-    fb_state: "_ExtractFallbackState"
-    lm: Any
-    sub_lm: Any
-    lm_hist_start: int
-    sub_hist_start: int
-    steps: list[IterationStep] = field(default_factory=list)
-
-
-@dataclass
 class _IterationCallbackState:
     step: IterationStep | None = None
     is_final: bool = False
@@ -129,13 +166,87 @@ class _ExtractFallbackState:
     count: int = 0
 
 
+# Fallback store for the per-run extract-fallback state when a traced run
+# executes without a RunContext (direct _forward_traced/_aforward_traced
+# calls). Task-local: asyncio Tasks copy the context, so concurrent direct
+# aforwards each see their own state.
+_EXTRACT_FALLBACK_STATE: ContextVar[_ExtractFallbackState | None] = ContextVar(
+    "predict_rlm_extract_fallback_state", default=None
+)
+
+
+@dataclass
+class _TraceExportContext:
+    steps: list[IterationStep]
+    lm: Any
+    sub_lm: Any
+    lm_hist_start: int
+    sub_hist_start: int
+    run_start: float
+
+
+class _RunStateField:
+    """Store mutable invocation state on the active RunContext."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    def __get__(self, instance: Any, owner: type | None = None) -> Any:
+        if instance is None:
+            return self
+        ctx = current_run_context()
+        if ctx is not None and self.name in ctx.state:
+            return ctx.state[self.name]
+        return instance.__dict__.get(self.name)
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        ctx = current_run_context()
+        if ctx is not None:
+            ctx.state[self.name] = value
+        else:
+            instance.__dict__[self.name] = value
+
+
+class _ExecutionSessionRepl:
+    """Compatibility view used while the iteration loop migrates to sessions."""
+
+    def __init__(
+        self,
+        session: Any,
+        run_code: Callable[..., Any] | None = None,
+    ) -> None:
+        self._session = session
+        self._run_code = run_code or session.run_code
+
+    async def aexecute(
+        self,
+        code: str,
+        variables: dict[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> Any:
+        result = await self._run_code(code, variables, timeout=timeout)
+        return result.value if isinstance(result, ExecutionResult) else result
+
+    def __getattr__(self, name: str) -> Any:
+        raise AttributeError(
+            f"Execution session {type(self._session).__name__} does not expose legacy "
+            f"interpreter operation {name!r}"
+        )
+
+
 # Capture the real dspy.Image class at import time so type comparisons
 # work even when tests patch predict_rlm.dspy.Image to a mock.
 _ImageType = dspy.Image
 
 _PARENT_TAKES_CODE = "code" in inspect.signature(dspy.RLM._process_execution_result).parameters
+_DSPY_EXTRACT_FALLBACK = dspy.RLM._extract_fallback
+logger = logging.getLogger(__name__)
 
 _NO_FIELD_DEFAULT = object()
+_RUN_PROMPT_SIGNATURE: ContextVar[tuple[object, Any] | None] = ContextVar(
+    "predict_rlm_run_prompt_signature", default=None
+)
 
 
 def _get_field_default(field: Any) -> Any:
@@ -163,22 +274,33 @@ def _to_json_safe(value: Any) -> Any:
     return value
 
 
-def _strip_code_fences(code: str) -> str:
-    """Extract code from markdown fences, accepting python/py/repl tags."""
-    matches = re.findall(
-        r"```(?:python|py|repl)?\s*\n(.*?)^```\s*$", code, re.DOTALL | re.MULTILINE
-    )
-    if matches:
-        return "\n\n".join(block.rstrip() for block in matches)
-    return code
+@runtime_checkable
+class RuntimeLoggingConfigurable(Protocol):
+    def configure_runtime(
+        self,
+        *,
+        debug: bool | None = None,
+        verbose: bool | None = None,
+    ) -> Any: ...
+
+
+@runtime_checkable
+class DebugLoggingConfigurable(Protocol):
+    def configure_debug(self, enabled: bool) -> Any: ...
+
+
+@runtime_checkable
+class VerboseLoggingConfigurable(Protocol):
+    def configure_verbose(self, enabled: bool) -> Any: ...
 
 
 def _format_execution_error(code: str, exc: Exception) -> str:
-    err = str(exc)
+    err = getattr(exc, "error_message", str(exc))
+    partial_output = getattr(exc, "partial_output", "")
     if code.count('"""') >= 3 and (
         "unterminated" in err.lower() or "invalid syntax" in err.lower()
     ):
-        return (
+        error = (
             f"[Error] {err}\n\n"
             'Hint: your code contains nested `"""` inside a '
             "triple-quoted string literal. Python cannot distinguish "
@@ -187,7 +309,31 @@ def _format_execution_error(code: str, exc: Exception) -> str:
             "single-quoted strings per line, or switch the outer "
             "delimiter to '''...'''."
         )
-    return f"[Error] {exc}"
+    else:
+        error = f"[Error] {err}"
+    return _prepend_partial_output(partial_output, error)
+
+
+def _prepend_partial_output(partial_output: str, error: str) -> str:
+    partial_output = partial_output.rstrip()
+    if not partial_output:
+        return error
+    return f"{partial_output}\n{error}"
+
+
+def _shorten_repl_output(output: str, max_output_chars: int) -> str:
+    if len(output) <= max_output_chars:
+        return output
+    return (
+        output[:max_output_chars]
+        + f"\n... (truncated to {max_output_chars}/{len(output):,} chars)"
+    )
+
+
+def _output_indicates_error(output: str) -> bool:
+    return any(
+        line.startswith(("[Error]", "[Type Error]")) for line in output.splitlines()
+    )
 
 
 def _sha256_text(value: str) -> str:
@@ -197,23 +343,31 @@ def _sha256_text(value: str) -> str:
 if TYPE_CHECKING:
     from dspy.signatures.signature import Signature
 
+    from .backends.sbx import SbxConfig, SbxPool
+
+
+@dataclass(frozen=True)
+class SubmitConfirmationContext:
+    """Context passed to PredictRLM submit-confirmation callbacks."""
+
+    inputs: dict[str, Any]
+    signature: type[Any]
+    output_field_names: tuple[str, ...]
+    prediction: dspy.Prediction
+    submitted_payload: dict[str, Any]
+    history: Any
+    latest_observation: str
+    reasoning: str
+    code: str
+    iteration: int
+
 
 _OUTPUT_VALIDATION_MODELS: dict[type[Any], type[Any]] = {}
 
 
 def _annotation_allows_none(annotation: Any) -> bool:
     """Return True when a type annotation explicitly accepts None."""
-    if annotation is Any:
-        return True
-    origin = get_origin(annotation)
-    if origin in (types.UnionType, getattr(types, "UnionType", object)):
-        return type(None) in get_args(annotation)
-
-    import typing as _typing
-
-    if origin is _typing.Union:
-        return type(None) in get_args(annotation)
-    return False
+    return annotation is Any or FieldDescriptor("", annotation).allows_none
 
 
 def _output_validation_model(signature: type[Any]) -> type[Any]:
@@ -271,6 +425,26 @@ def _validate_signature_outputs(
         )
 
 
+def _with_optional_output_defaults(
+    signature: type[Any],
+    parsed_result: Any,
+) -> dict[str, Any] | None:
+    if not isinstance(parsed_result, dict):
+        return None
+    missing = [
+        name for name in signature.output_fields
+        if name not in parsed_result
+    ]
+    if not missing:
+        return parsed_result
+    if any(signature.output_fields[name].is_required() for name in missing):
+        return None
+    filled = dict(parsed_result)
+    for name in missing:
+        filled[name] = signature.output_fields[name].default
+    return filled
+
+
 class _ValidatingOutputAdapterMixin:
     """Validate adapter outputs before they become DSPy Predictions."""
 
@@ -305,7 +479,15 @@ class _ValidatingJSONAdapter(_ValidatingOutputAdapterMixin, JSONAdapter):
 
     def parse(self, signature: type[Any], completion: str) -> dict[str, Any]:
         self._reject_required_json_nulls(signature, completion)
-        fields = super().parse(signature, completion)
+        try:
+            fields = super().parse(signature, completion)
+        except AdapterParseError as exc:
+            fields = _with_optional_output_defaults(
+                signature,
+                getattr(exc, "parsed_result", None),
+            )
+            if fields is None:
+                raise
         _validate_signature_outputs(
             adapter_name=type(self).__name__,
             signature=signature,
@@ -350,6 +532,24 @@ class _ValidatingJSONAdapter(_ValidatingOutputAdapterMixin, JSONAdapter):
 class _ValidatingChatAdapter(_ValidatingOutputAdapterMixin, ChatAdapter):
     """ChatAdapter whose fallback preserves client-side output validation."""
 
+    def parse(self, signature: type[Any], completion: str) -> dict[str, Any]:
+        try:
+            fields = super().parse(signature, completion)
+        except AdapterParseError as exc:
+            fields = _with_optional_output_defaults(
+                signature,
+                getattr(exc, "parsed_result", None),
+            )
+            if fields is None:
+                raise
+        _validate_signature_outputs(
+            adapter_name=type(self).__name__,
+            signature=signature,
+            parsed_result=fields,
+            lm_response=completion,
+        )
+        return fields
+
     def __call__(
         self,
         lm: Any,
@@ -391,6 +591,26 @@ class _ValidatingChatAdapter(_ValidatingOutputAdapterMixin, ChatAdapter):
                 demos,
                 inputs,
             )
+
+
+_NO_RECOVERABLE_DEFAULT = object()
+
+
+def _schema_field_default(field_info: dict) -> Any:
+    """Default for a not-required field whose schema carries no explicit ``default``.
+
+    These are almost always ``default_factory`` collection fields (pydantic does not
+    serialize a factory's value into the JSON schema). Return a type-appropriate empty
+    default so the field stays OMITTABLE without becoming NULLABLE. Returns the
+    ``_NO_RECOVERABLE_DEFAULT`` sentinel when no sensible default can be inferred
+    (e.g. a scalar ``default_factory``), so the caller can fall back to a lenient type.
+    """
+    schema_type = field_info.get("type")
+    if schema_type == "array":
+        return Field(default_factory=list)
+    if schema_type == "object":
+        return Field(default_factory=dict)
+    return _NO_RECOVERABLE_DEFAULT
 
 
 def _models_from_schema(schema: dict) -> dict[str, type]:
@@ -489,10 +709,30 @@ def _models_from_schema(schema: dict) -> dict[str, type]:
 
         for field_name, field_info in props.items():
             py_type = get_python_type(field_info)
+            # required-ness controls the DEFAULT, not nullability. A field's
+            # nullability is already encoded in its type (get_python_type maps
+            # anyOf-with-null to Optional); "not required" only means "may be omitted
+            # because it has a default", NOT "may be null". Reconstructing every
+            # not-required field as Optional[T]=None (the old behavior) handed the LM
+            # a weaker schema than the user's model -- so the LM emitted null for
+            # defaulted non-Optional fields, and the original model then rejected it.
             if field_name in required:
                 fields[field_name] = (py_type, ...)
+            elif "default" in field_info:
+                # Preserve the real default (e.g. mandatory: bool = True); keep the
+                # declared, possibly non-nullable type.
+                fields[field_name] = (py_type, field_info["default"])
             else:
-                fields[field_name] = (Optional[py_type], None)  # type: ignore[valid-type]
+                # Not required, no explicit default in the schema (default_factory).
+                # Provide a type-appropriate empty default so the field stays
+                # omittable without advertising null to the LM.
+                default = _schema_field_default(field_info)
+                if default is _NO_RECOVERABLE_DEFAULT:
+                    # Can't recover the default (e.g. a scalar default_factory); fall
+                    # back to the lenient Optional[T]=None so we don't over-constrain.
+                    fields[field_name] = (Optional[py_type], None)  # type: ignore[valid-type]
+                else:
+                    fields[field_name] = (py_type, default)
 
         built_models[name] = create_model(name, **fields)  # type: ignore[call-overload]
 
@@ -547,13 +787,13 @@ Use `predict()` whenever you need the model to read content and produce structur
 ### Execution model
 The REPL runs inside an async event loop — use `await` directly, not `asyncio.run()`.
 
-## Managing state & output
+{execution_timeout_instructions}## Managing state & output
 
-Each iteration's printed output is captured and shown to you in subsequent iterations, but **truncated to ~5000 characters**. This is a hard limit — output beyond 5K chars is cut off.
+Each iteration's printed output is captured and shown to you in subsequent iterations, but **truncated to {max_output_chars:,} characters**. Output beyond that limit is cut off.
 
-**What persists fully:** Python variables. Everything you store in a variable (`all_items`, `records`, `chunks`, etc.) survives intact across iterations. The runtime state is never lost.
+**What persists fully:** Python variables. Everything you store in a variable (`all_items`, `records`, `chunks`, etc.) survives intact across successful iterations and cooperative timeouts. If a hard-kill timeout is required, the runtime restores only the pre-timeout pickleable globals snapshot and reports any unpickleable names that were lost.
 
-**What gets truncated:** printed output. If you `print(big_list)` and it's 50K chars, you'll only see the first 5K in the next iteration's context.
+**What gets truncated:** printed output. If you `print(big_list)` and it's longer than {max_output_chars:,} characters, you'll only see a shortened view in the next iteration's context.
 
 **How to work effectively across iterations:**
 - **Store in variables, print summaries:** `items.extend(new_items); print(f"{{len(items)}} items so far")` — the data is in `items` (full), you see the count (tiny).
@@ -789,8 +1029,16 @@ class PredictRLM(dspy.RLM):
     # Override reserved tool names - we allow predict but not llm_query
     _RESERVED_TOOL_NAMES = frozenset({"SUBMIT", "print"})
 
-    # Captured context LM from forward() - used by predict() in thread pool
-    _context_lm: dspy.LM | None = None
+    _context_lm = _RunStateField("_context_lm")
+    _partial_history = _RunStateField("_partial_history")
+    _partial_pending_entry = _RunStateField("_partial_pending_entry")
+    _partial_pending_start = _RunStateField("_partial_pending_start")
+    _current_telemetry_context = _RunStateField("_current_telemetry_context")
+    _current_predictor_id = _RunStateField("_current_predictor_id")
+    _trace_export_context = _RunStateField("_trace_export_context")
+    _pending_submit_confirmation = _RunStateField("_pending_submit_confirmation")
+    _last_action_lm_usage = _RunStateField("_last_action_lm_usage")
+    _last_action_lm_metadata = _RunStateField("_last_action_lm_metadata")
 
     def __init__(
         self,
@@ -802,11 +1050,11 @@ class PredictRLM(dspy.RLM):
         max_iterations: int = 30,
         max_llm_calls: int = 50,
         max_extract_fallbacks: int = 1,
-        max_output_chars: int = 100_000,
-        verbose: bool = False,
+        max_output_chars: int = 50_000,
+        verbose: bool = True,
         tools: dict[str, Callable[..., str]] | list[Callable] | None = None,
         interpreter: CodeInterpreter | None = None,
-        sandbox_backend: SandboxBackend | str | None = None,
+        sandbox_backend: BackendName | str | None = None,
         sbx_config: SbxConfig | None = None,
         sbx_pool: SbxPool | None = None,
         allowed_domains: list[str] | None = None,
@@ -814,6 +1062,17 @@ class PredictRLM(dspy.RLM):
         debug: bool = False,
         output_dir: str | Path | None = None,
         telemetry_context: TelemetryContext | None = None,
+        submit_confirmation: Callable[[SubmitConfirmationContext], str | None] | None = None,
+        trace_export_path: str | Path | None = None,
+        runtime_hooks: list[RuntimeHook] | None = None,
+        on_runtime_hook_event: Callable[[RuntimeHookEvent], Any] | None = None,
+        model_execution_timeout: bool = False,
+        *,
+        adapters: Sequence[InputAdapter[Any] | OutputAdapter[Any]] = (),
+        execution: ExecutionBackend | None = None,
+        modules: tuple[RuntimeModule | RuntimeContribution, ...]
+        | list[RuntimeModule | RuntimeContribution] = (),
+        events: Sequence[EventSink] = (),
     ):
         """
         Args:
@@ -863,19 +1122,20 @@ class PredictRLM(dspy.RLM):
                           call via a ``max_extract_fallbacks`` keyword to
                           ``forward()`` / ``aforward()``.
             max_output_chars: Maximum characters to include from REPL output.
-            verbose: Whether to log detailed execution info.
+            verbose: Whether to log compact per-iteration progress.
+                  Defaults to True; pass False for quiet execution.
             tools: Additional tool functions callable from interpreter code.
                   Accepts a dict mapping names to callables, or a list of
                   callables (names inferred from __name__).
                   predict is added automatically if not already provided.
-            interpreter: CodeInterpreter implementation to use. Defaults to
-                        JSPI-enabled JspiInterpreter.
+            interpreter: CodeInterpreter-compatible execution backend to use.
+                        Defaults to JSPI-enabled JspiBackend.
             sandbox_backend: Named sandbox backend to create when interpreter
                             is not provided. Defaults to "jspi"; pass "sbx"
                             to opt into Docker Sandboxes.
             sbx_config: Docker Sandboxes backend configuration.
-            sbx_pool: Prewarmed Docker Sandboxes interpreter pool. Requires
-                      ``sandbox_backend="sbx"`` and owns its interpreter config.
+            sbx_pool: Prewarmed Docker Sandboxes backend pool. Requires
+                      ``sandbox_backend="sbx"`` and owns its backend config.
             allowed_domains: Domains/IPs the sandbox can access via network.
                             By default, no network access is allowed.
                             Example: ["api.example.com", "192.168.1.100:8080"]
@@ -883,15 +1143,44 @@ class PredictRLM(dspy.RLM):
                    PyPI packages, and tools. Skills are merged automatically —
                    instructions are appended to the prompt, packages are installed
                    in the sandbox, and tools are exposed alongside predict().
-            debug: If True, print REPL code, output, errors, and tool calls
-                  to stderr in real-time. Useful for development.
-            output_dir: Default host directory for output files. When set,
-                       File output fields without an explicit path
-                       are written here. If None, a temp directory is used.
+            debug: If True, enable interpreter debug output and lifecycle
+                  diagnostics. Debug does not imply verbose RLM trace output.
+            output_dir: Constructor convenience that collects generated File and
+                       list[File] outputs under ``<output_dir>/<field>/``. It does
+                       not redirect scalar or JSON outputs, logs, or traces. If
+                       None, generated files are collected in a temp directory.
             telemetry_context: Optional run/case telemetry context for
                        OTel-shaped local JSONL events. Disabled/failed
                        telemetry writes are always ignored.
+            submit_confirmation: Optional callback invoked after a valid
+                       SUBMIT. It receives SubmitConfirmationContext and may
+                       return a message to feed back as the next observation.
+                       Returning None or "" preserves normal immediate submit.
+            trace_export_path: Optional path for best-effort atomic RunTrace
+                       snapshots while the run is in progress. The file is
+                       replaced in place and trace export failures are ignored.
+            model_execution_timeout: Whether the action LM may set a per-iteration
+                       ``execution_timeout_seconds`` to soft-cap (recoverably
+                       interrupt) its own code blocks. Off by default — models
+                       tend to under-set it and kill legitimately slow work (e.g.
+                       30s-2min predict() calls). When off, the host watchdog
+                       (``SbxConfig.exec_timeout`` / JSPI ``exec_timeout``, default
+                       300s) remains as the hang guard. Set True to restore the
+                       model-chosen timeout knob.
+            adapters: Additional input and output adapters contributed to the runtime.
+            execution: Small-kernel execution backend. Mutually exclusive with
+                       interpreter and sandbox backend options.
+            modules: Runtime contribution factories or resolved contributions.
+            events: Runtime event sinks.
         """
+        if execution is not None and any(
+            value is not None
+            for value in (interpreter, sandbox_backend, sbx_config, sbx_pool)
+        ):
+            raise ValueError(
+                "Pass execution or interpreter/sandbox_backend/sbx_config/sbx_pool "
+                "options, not both."
+            )
         if interpreter is not None and sbx_pool is not None:
             raise ValueError(
                 "Pass either interpreter or sbx_pool, not both. "
@@ -902,13 +1191,24 @@ class PredictRLM(dspy.RLM):
                 "Pass either interpreter or sandbox_backend, not both. "
                 "A custom interpreter is already a complete sandbox backend."
             )
-        self._sandbox_backend = SandboxBackend(sandbox_backend or SandboxBackend.JSPI)
-        if sbx_pool is not None and self._sandbox_backend is not SandboxBackend.SBX:
+        self._sandbox_backend = BackendName(sandbox_backend or BackendName.JSPI)
+        if sbx_pool is not None and self._sandbox_backend is not BackendName.SBX:
             raise ValueError("sbx_pool requires sandbox_backend='sbx'.")
         if sbx_pool is not None and sbx_config is not None:
             raise ValueError("Pass sbx_config to SbxPool when using sbx_pool.")
+        runtime_hooks = list(runtime_hooks or [])
+        if (
+            runtime_hooks
+            and interpreter is None
+            and sbx_pool is None
+            and self._sandbox_backend is not BackendName.SBX
+        ):
+            raise ValueError("runtime_hooks require the SBX backend in PredictRLM v1")
+        self._runtime_hooks = runtime_hooks
+        self._on_runtime_hook_event = on_runtime_hook_event
+        self._model_execution_timeout = model_execution_timeout
         self._sbx_pool = sbx_pool
-        self._sbx_config = sbx_config or SbxConfig()
+        self._sbx_config = sbx_config
 
         # Store main LM. ``dspy.LM.copy()`` gives a fresh history so
         # concurrent PredictRLM instances don't share mutable state —
@@ -955,10 +1255,17 @@ class PredictRLM(dspy.RLM):
         # Store allowed_domains, debug, and output_dir for interpreter creation
         self._allowed_domains = allowed_domains
         self._debug = debug
+        configure_predict_rlm_logging(
+            debug=True if debug else None,
+            verbose=True if verbose else None,
+        )
         self._output_dir = str(output_dir) if output_dir else None
         self._telemetry_context = telemetry_context
         self._current_telemetry_context: TelemetryContext | None = None
         self._current_predictor_id: str | None = None
+        self._submit_confirmation = submit_confirmation
+        self._trace_export_path = Path(trace_export_path) if trace_export_path else None
+        self._trace_export_context: _TraceExportContext | None = None
 
         # Merge skills into instructions, packages, modules, tools, and setup
         self._skill_instructions = ""
@@ -1026,6 +1333,194 @@ class PredictRLM(dspy.RLM):
         # write) so it is atomic under the asyncio event loop.
         self.max_extract_fallbacks = max_extract_fallbacks
         self._extract_fallback_count = 0
+
+        from .in_context import _in_context_field_names
+
+        _in_context_field_names(self.signature)
+        expanded_modules = tuple(
+            module() if callable(module) else module for module in modules
+        )
+        if not all(isinstance(module, RuntimeContribution) for module in expanded_modules):
+            raise TypeError("Runtime modules must return RuntimeContribution")
+        module_selects_execution = any(
+            module.execution is not None for module in expanded_modules
+        )
+        execution_options_selected = any(
+            value is not None
+            for value in (interpreter, sandbox_backend, sbx_config, sbx_pool)
+        )
+
+        if execution is None and not (
+            module_selects_execution and not execution_options_selected
+        ):
+            resolved_execution = execution_from_options(
+                owner=self,
+                interpreter=interpreter,
+                sandbox_backend=self._sandbox_backend,
+                sbx_config=self._sbx_config,
+                sbx_pool=self._sbx_pool,
+                allowed_domains=self._allowed_domains,
+                runtime_hooks=self._runtime_hooks,
+                on_runtime_hook_event=self._on_runtime_hook_event,
+            )
+        elif execution is not None:
+            resolved_execution = ExistingExecutionBackendAdapter(execution)
+        else:
+            resolved_execution = None
+        runtime_tools = tuple(
+            CallableTool(
+                name=name,
+                function=tool.func,
+                description=str(getattr(tool, "desc", "") or ""),
+                schema=getattr(tool, "args", {}) or {},
+            )
+            for name, tool in self._user_tools.items()
+        )
+        configured_adapters = (
+            *tuple(adapters),
+            *(adapter for module in expanded_modules for adapter in module.adapters),
+        )
+        unsafe_ctx_str_replacements = [
+            adapter
+            for adapter in configured_adapters
+            if isinstance(adapter, InputAdapter)
+            if adapter.name == CtxStrInputAdapter.name
+            if not isinstance(adapter, CtxStrInputAdapter)
+        ]
+        if unsafe_ctx_str_replacements:
+            raise TypeError(
+                "The built-in 'ctx_str' adapter may only be replaced by a "
+                "CtxStrInputAdapter instance or subclass."
+            )
+        configured_input_names = {
+            adapter.name
+            for adapter in configured_adapters
+            if isinstance(adapter, InputAdapter)
+        }
+        configured_output_names = {
+            adapter.name
+            for adapter in configured_adapters
+            if isinstance(adapter, OutputAdapter)
+        }
+        configured_tool_operation_names = {
+            operation.name
+            for module in expanded_modules
+            for operation in module.tool_operations
+        }
+        file_compatibility_contribution = file_compatibility(
+            output_dir=self._output_dir
+        )
+        compatibility_inputs = tuple(
+            adapter
+            for adapter in (
+                CtxStrInputAdapter(),
+                ValueInputAdapter(),
+                *file_compatibility_contribution.adapters,
+            )
+            if isinstance(adapter, InputAdapter)
+            if adapter.name not in configured_input_names
+        )
+        compatibility_outputs = tuple(
+            adapter
+            for adapter in file_compatibility_contribution.adapters
+            if isinstance(adapter, OutputAdapter)
+            if adapter.name not in configured_output_names
+        )
+        compatibility_tool_operations = (
+            ()
+            if SyncedFileToolOperation.name in configured_tool_operation_names
+            else (SyncedFileToolOperation(),)
+        )
+        runtime_spec = resolve_runtime_spec(
+            direct=RuntimeContribution(
+                instructions=(self._skill_instructions,) if self._skill_instructions else (),
+                adapters=(
+                    *compatibility_inputs,
+                    *compatibility_outputs,
+                    *tuple(adapters),
+                ),
+                tools=runtime_tools,
+                packages=tuple(self._skill_packages),
+                execution=resolved_execution,
+                events=tuple(events),
+                validators=file_compatibility_contribution.validators,
+                tool_operations=compatibility_tool_operations,
+            ),
+            modules=expanded_modules,
+        )
+        if not callable(
+            getattr(runtime_spec.execution, "validate_host_directory_mounts", None)
+        ):
+            runtime_spec = replace(
+                runtime_spec,
+                execution=ExistingExecutionBackendAdapter(runtime_spec.execution),
+            )
+        self._runtime_spec = runtime_spec
+        for validator in self._runtime_spec.validators:
+            validator(self.signature)
+        for field_name, field_info in self.signature.output_fields.items():
+            field = FieldDescriptor(field_name, field_info.annotation)
+            matches = [
+                adapter
+                for adapter in self._runtime_spec.output_adapters
+                if adapter.supports(field)
+            ]
+            if len(matches) > 1:
+                resolve_output_adapter(matches, field)
+        action_signature, extract_signature = self._build_signatures()
+        self.generate_action = dspy.Predict(action_signature)
+        self.extract = dspy.Predict(extract_signature)
+
+    @property
+    def runtime_spec(self) -> RuntimeSpec:
+        return self._runtime_spec
+
+    def _acquire_runtime_interpreter(
+        self,
+        spec: ExecutionSpec,
+        ctx: RunContext,
+    ):
+        return self._interpreter_context(execution_tools=dict(spec.tools))
+
+    def _new_run_context(self, input_values: dict[str, Any]) -> RunContext:
+        ctx = RunContext(self.runtime_spec, input_values)
+        ctx.state["lm"] = (
+            self._lm.copy() if isinstance(self._lm, dspy.LM) else self._lm
+        )
+        ctx.state["sub_lm"] = (
+            self._sub_lm.copy() if isinstance(self._sub_lm, dspy.LM) else self._sub_lm
+        )
+        return ctx
+
+    def _active_sub_lm(self) -> Any:
+        ctx = current_run_context()
+        return ctx.state.get("sub_lm") if ctx is not None else self._sub_lm
+
+    def _evidence(self) -> EvidenceRecorder | None:
+        ctx = current_run_context()
+        if ctx is None:
+            return None
+        recorder = ctx.state.get("evidence")
+        return recorder if isinstance(recorder, EvidenceRecorder) else None
+
+    def _runtime_packages(self) -> tuple[str, ...]:
+        spec = getattr(self, "_runtime_spec", None)
+        return spec.packages if spec is not None else tuple(self._skill_packages)
+
+    def _runtime_tool_functions(self) -> dict[str, Callable[..., Any]]:
+        spec = getattr(self, "_runtime_spec", None)
+        if spec is None:
+            return {name: tool.func for name, tool in self._user_tools.items()}
+        return {
+            tool.name: tool.function if isinstance(tool, CallableTool) else tool
+            for tool in spec.tools
+        }
+
+    def _runtime_instructions(self) -> str:
+        spec = getattr(self, "_runtime_spec", None)
+        if spec is None:
+            return self._skill_instructions
+        return "\n\n".join(spec.instructions)
 
     def _create_predict_tool(self) -> Callable[..., dict[str, Any]]:
         """Create the predict tool for running DSPy signatures."""
@@ -1133,8 +1628,14 @@ class PredictRLM(dspy.RLM):
                 )
                 print(result["tasks"])  # List of TaskItem dicts
             """
+            recorder = rlm_instance._evidence()
+            predict_call_id = uuid.uuid4().hex
             # Priority: sub_lm > captured context LM > current settings.lm
-            lm = rlm_instance._sub_lm or rlm_instance._context_lm or dspy.settings.lm
+            lm = (
+                rlm_instance._active_sub_lm()
+                or rlm_instance._context_lm
+                or dspy.settings.lm
+            )
             if lm is None:
                 raise RuntimeError(
                     "No LM available for predict. Either pass sub_lm to PredictRLM "
@@ -1158,14 +1659,10 @@ class PredictRLM(dspy.RLM):
                         built = _models_from_schema(schema)
                         custom_types.update(built)
                     except Exception as e:
-                        import logging
-
-                        logging.getLogger(__name__).warning(
+                        logger.warning(
                             f"Failed to reconstruct Pydantic model '{name}' from schema: {e}"
                         )
             else:
-                import logging
-
                 # Check if signature has custom types (capitalized identifiers)
                 pattern = r"(?<![.\w])([A-Z][A-Za-z0-9_]*)"
                 matches = re.findall(pattern, signature)
@@ -1183,7 +1680,7 @@ class PredictRLM(dspy.RLM):
                 }
                 custom_in_sig = [m for m in matches if m not in builtins]
                 if custom_in_sig:
-                    logging.getLogger(__name__).debug(
+                    logger.debug(
                         f"predict() called with custom types {custom_in_sig} in signature "
                         f"but no pydantic_schemas provided. This may cause parsing issues. "
                         f"If using asyncio.gather(), ensure Pydantic models are defined in "
@@ -1201,10 +1698,6 @@ class PredictRLM(dspy.RLM):
                 else:
                     sig = dspy.Signature(signature, "")
             except Exception as e:
-                import logging
-
-                logger = logging.getLogger(__name__)
-
                 if "Unknown name" in str(e):
                     pattern = r"(?<![.\w])([A-Z][A-Za-z0-9_]*)"
                     custom_types_in_sig = re.findall(pattern, signature)
@@ -1254,6 +1747,15 @@ class PredictRLM(dspy.RLM):
             _call_start = time.perf_counter()
             _hist_len_before = snapshot_lm_history_len(lm)
             result: dict[str, Any] = {}
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.PREDICT_STARTED,
+                    call_id=predict_call_id,
+                    signature=signature,
+                    instructions=instructions,
+                    model=str(getattr(lm, "model", lm)),
+                    input=kwargs,
+                )
             try:
                 with dspy.context(lm=lm):
                     prediction = await predictor.acall(**wrapped_kwargs)
@@ -1332,7 +1834,7 @@ class PredictRLM(dspy.RLM):
                                 f"is acceptable."
                             )
                     result[field] = _to_serializable(value)
-            except Exception as exc:
+            except BaseException as exc:
                 record_predict_call(
                     _RawPredictCall(
                         signature=signature,
@@ -1346,6 +1848,18 @@ class PredictRLM(dspy.RLM):
                         lm=lm_finish_since(lm, _hist_len_before),
                     )
                 )
+                if recorder is not None:
+                    try:
+                        await recorder.emit(
+                            RunEventKind.PREDICT_FINISHED,
+                            call_id=predict_call_id,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                            cancelled=isinstance(exc, asyncio.CancelledError),
+                            output=result,
+                        )
+                    except BaseException as evidence_error:
+                        setattr(exc, "evidence_error", evidence_error)
                 raise
             else:
                 record_predict_call(
@@ -1360,6 +1874,12 @@ class PredictRLM(dspy.RLM):
                         lm=lm_finish_since(lm, _hist_len_before),
                     )
                 )
+                if recorder is not None:
+                    await recorder.emit(
+                        RunEventKind.PREDICT_FINISHED,
+                        call_id=predict_call_id,
+                        output=result,
+                    )
                 return result
 
         return predict
@@ -1378,14 +1898,13 @@ class PredictRLM(dspy.RLM):
         """
         from dspy.primitives.code_interpreter import SIMPLE_TYPES
 
-        from .files import _is_list_annotation, is_file_type
-
         fields = []
         for name, field in self.signature.output_fields.items():
             annotation = getattr(field, "annotation", str)
+            descriptor = FieldDescriptor(name, annotation)
             field_info = {"name": name}
-            if is_file_type(annotation):
-                field_info["type"] = "list" if _is_list_annotation(annotation) else "str"
+            if descriptor.matches(File):
+                field_info["type"] = "list" if descriptor.is_list else "str"
             elif annotation in SIMPLE_TYPES:
                 field_info["type"] = annotation.__name__
             default = _get_field_default(field)
@@ -1407,8 +1926,6 @@ class PredictRLM(dspy.RLM):
         or a ``File`` instance, so we wrap bare strings before the parent's
         ``parse_value`` runs.
         """
-        from .files import _is_list_annotation, is_file_type
-
         self._phase_log("process_final_output:enter")
         raw = result.output
         if isinstance(raw, dict):
@@ -1416,10 +1933,13 @@ class PredictRLM(dspy.RLM):
                 if name not in raw:
                     continue
                 field = self.signature.output_fields.get(name)
-                if field is None or not is_file_type(field.annotation):
+                if field is None:
+                    continue
+                descriptor = FieldDescriptor(name, field.annotation)
+                if not descriptor.matches(File):
                     continue
                 val = raw[name]
-                if _is_list_annotation(field.annotation):
+                if descriptor.is_list:
                     if isinstance(val, list):
                         raw[name] = [{"path": v} if isinstance(v, str) else v for v in val]
                 elif isinstance(val, str):
@@ -1432,11 +1952,50 @@ class PredictRLM(dspy.RLM):
         self,
         execution_tools: dict[str, Callable],
         file_plan: dict[str, Any] | None = None,
-    ) -> Iterator[PredictRLMInterpreter]:
+    ) -> Iterator[LegacyExecutionBackend]:
         """Yield interpreter, creating the configured backend if none provided."""
         if self._interpreter is not None:
-            self._inject_execution_context(self._interpreter, execution_tools)
-            yield self._interpreter
+            if self._runtime_hooks:
+                configure_runtime = self._declared_callable(
+                    self._interpreter, "configure_runtime"
+                )
+                runtime_kwargs: dict[str, Any] = {}
+                if configure_runtime is not None:
+                    runtime_kwargs = self._accepted_kwargs(
+                        configure_runtime,
+                        tools=execution_tools,
+                        output_fields=self._get_output_fields_info(),
+                        runtime_hooks=self._runtime_hooks,
+                        on_runtime_hook_event=self._on_runtime_hook_event,
+                    )
+                if configure_runtime is None or "runtime_hooks" not in runtime_kwargs:
+                    raise ValueError("runtime_hooks require an SBX-compatible interpreter")
+                configure_runtime(**runtime_kwargs)
+            else:
+                self._inject_execution_context(self._interpreter, execution_tools)
+            skill_packages_configured = self._ensure_interpreter_skill_packages(
+                self._interpreter
+            )
+            backend = self._interpreter_backend_label(self._interpreter)
+            configured = self._configure_interpreter_debug(self._interpreter)
+            self._log_lifecycle(
+                "interpreter.injected",
+                backend=backend,
+                interpreter=type(self._interpreter).__name__,
+                debug_configured=configured["debug"],
+                verbose_configured=configured["verbose"],
+                skill_packages_configured=skill_packages_configured,
+                owner="caller",
+            )
+            try:
+                yield self._interpreter
+            finally:
+                self._log_lifecycle(
+                    "interpreter.released",
+                    backend=backend,
+                    interpreter=type(self._interpreter).__name__,
+                    owner="caller",
+                )
         else:
             extra_read = list(file_plan["read_paths"]) if file_plan else []
             extra_write = (
@@ -1451,43 +2010,374 @@ class PredictRLM(dspy.RLM):
                 "tools": execution_tools,
                 "output_fields": self._get_output_fields_info(),
                 "allowed_domains": self._allowed_domains,
-                "skill_packages": self._skill_packages or None,
+                "skill_packages": list(self._runtime_packages()) or None,
                 "debug": self._debug,
+                "verbose": self._iteration_logging_enabled(),
                 "extra_read_paths": extra_read or None,
                 "extra_write_paths": extra_write,
             }
             if self._sbx_pool is not None:
+                self._log_lifecycle(
+                    "sbx.pool.lease.request",
+                    backend="sbx",
+                    tools=len(execution_tools),
+                    output_fields=len(self._get_output_fields_info()),
+                )
                 with self._sbx_pool.lease(
                     tools=execution_tools,
                     output_fields=self._get_output_fields_info(),
+                    skill_packages=list(self._runtime_packages()) or None,
+                    debug=self._debug,
+                    verbose=self._iteration_logging_enabled(),
+                    runtime_hooks=self._runtime_hooks,
+                    on_runtime_hook_event=self._on_runtime_hook_event,
                 ) as repl:
-                    yield repl
+                    self._log_lifecycle(
+                        "sbx.pool.lease.acquired",
+                        backend="sbx",
+                        interpreter=type(repl).__name__,
+                    )
+                    try:
+                        yield repl
+                    finally:
+                        self._log_lifecycle(
+                            "sbx.pool.lease.released",
+                            backend="sbx",
+                            interpreter=type(repl).__name__,
+                        )
                 return
-            if self._sandbox_backend is SandboxBackend.SBX:
-                repl = SbxInterpreter(config=self._sbx_config, **interpreter_kwargs)
+            if self._sandbox_backend is BackendName.SBX:
+                from .backends.sbx import SbxBackend, SbxConfig
+
+                self._log_lifecycle(
+                    "interpreter.create",
+                    backend="sbx",
+                    tools=len(execution_tools),
+                    output_fields=len(self._get_output_fields_info()),
+                    allowed_domains=len(self._allowed_domains or []),
+                    skill_packages=len(self._runtime_packages()),
+                )
+                repl = SbxBackend(
+                    config=self._sbx_config or SbxConfig(),
+                    runtime_hooks=self._runtime_hooks,
+                    on_runtime_hook_event=self._on_runtime_hook_event,
+                    **interpreter_kwargs,
+                )
             else:
-                repl = JspiInterpreter(
+                self._log_lifecycle(
+                    "interpreter.create",
+                    backend="jspi",
+                    tools=len(execution_tools),
+                    output_fields=len(self._get_output_fields_info()),
+                    allowed_domains=len(self._allowed_domains or []),
+                    skill_packages=len(self._runtime_packages()),
+                )
+                repl = JspiBackend(
                     **interpreter_kwargs,
                     telemetry_context=self._current_telemetry_context,
                 )
             try:
                 yield repl
             finally:
+                self._log_lifecycle(
+                    "interpreter.shutdown",
+                    backend=self._interpreter_backend_label(repl),
+                    interpreter=type(repl).__name__,
+                    owner="predict_rlm",
+                )
                 repl.shutdown()
+
+    @asynccontextmanager
+    async def _execution_session(
+        self,
+        execution_tools: dict[str, Callable[..., Any]],
+        file_plan: dict[str, Any] | None = None,
+    ) -> AsyncIterator[Any]:
+        ctx = current_run_context()
+        if ctx is None:
+            kwargs = {"execution_tools": execution_tools}
+            if file_plan is not None:
+                kwargs["file_plan"] = file_plan
+            with self._interpreter_context(**kwargs) as repl:
+                yield repl
+            return
+        await self._open_runtime_inputs(ctx)
+        try:
+            validate_sandbox_root_reservations(ctx.input_bindings)
+            requirements = merge_session_requirements(
+                (
+                    SessionRequirements(
+                        allowed_domains=tuple(self._allowed_domains or ()),
+                        extra_read_paths=tuple(self._skill_modules.values()),
+                    ),
+                    *(
+                        binding.prepared.requirements
+                        for binding in ctx.input_bindings.values()
+                    ),
+                    *ctx.output_requirements.values(),
+                    *(
+                        SessionRequirements(
+                            extra_read_paths=tuple(
+                                getattr(tool, "extra_read_paths", ())
+                            ),
+                            extra_write_paths=tuple(
+                                getattr(tool, "extra_write_paths", ())
+                            ),
+                        )
+                        for tool in self.runtime_spec.tools
+                    ),
+                )
+            )
+            execution_spec = ExecutionSpec(
+                tools=execution_tools,
+                output_fields=tuple(self._get_output_fields_info()),
+                packages=tuple(self.runtime_spec.packages),
+                allowed_domains=requirements.allowed_domains,
+                extra_read_paths=requirements.extra_read_paths,
+                extra_write_paths=requirements.extra_write_paths,
+                host_directory_mounts=tuple(
+                    mount
+                    for binding in ctx.input_bindings.values()
+                    for mount in binding.prepared.host_directory_mounts
+                ),
+                sandbox_roots=tuple(
+                    root
+                    for binding in ctx.input_bindings.values()
+                    for root in binding.prepared.sandbox_roots
+                ),
+                debug=self._debug,
+                verbose=self._iteration_logging_enabled(),
+                metadata={"has_file_plan": file_plan is not None},
+            )
+        except BaseException as exc:
+            try:
+                await self._finalize_runtime_inputs(ctx, None, exc)
+            except BaseException as finalize_error:
+                setattr(exc, "input_adapter_finalize_error", finalize_error)
+                await self._record_pre_session_finalize_failure(finalize_error)
+            raise
+        recorder = self._evidence()
+        session_name: str | None = None
+        primary: BaseException | None = None
+        release_succeeded = False
+        try:
+            await self.runtime_spec.execution.validate_host_directory_mounts(
+                execution_spec.host_directory_mounts,
+                ctx,
+            )
+            async with self.runtime_spec.execution.start(execution_spec, ctx) as session:
+                session_name = session.name
+                ctx.session = session
+                ctx.ownership = session.ownership
+                try:
+                    if recorder is not None:
+                        await recorder.emit(
+                            RunEventKind.SESSION_STARTED,
+                            backend=session.name,
+                            ownership=getattr(session.ownership, "value", session.ownership),
+                        )
+                    await session.install_packages(self.runtime_spec.packages)
+                    if recorder is not None:
+                        await recorder.emit(
+                            RunEventKind.PACKAGES_INSTALLED,
+                            packages=list(self.runtime_spec.packages),
+                        )
+                    repl = _ExecutionSessionRepl(
+                        session,
+                        lambda code, variables=None, timeout=None: self._run_session_code(
+                            ctx,
+                            code,
+                            variables,
+                            timeout=timeout,
+                        ),
+                    )
+                    yield repl
+                except BaseException as exc:
+                    primary = exc
+                    try:
+                        await asyncio.shield(session.cancel())
+                    except BaseException as cancel_error:
+                        setattr(exc, "session_cancel_error", cancel_error)
+                    raise
+                finally:
+                    finalize_task = asyncio.create_task(
+                        self._finalize_runtime_inputs(ctx, session, primary)
+                    )
+                    finalize_cancellation: asyncio.CancelledError | None = None
+                    try:
+                        try:
+                            await asyncio.shield(finalize_task)
+                        except asyncio.CancelledError as exc:
+                            finalize_cancellation = exc
+                            if primary is None:
+                                primary = exc
+                            else:
+                                setattr(primary, "session_finalize_cancellation", exc)
+                            await finalize_task
+                        if recorder is not None:
+                            await recorder.emit(
+                                RunEventKind.SESSION_FINALIZED,
+                                backend=session.name,
+                            )
+                    except BaseException as finalize_error:
+                        if recorder is not None:
+                            recorder.mark_incomplete(finalize_error)
+                            try:
+                                await recorder.emit(
+                                    RunEventKind.SESSION_FINALIZE_FAILED,
+                                    backend=session.name,
+                                    error_type=type(finalize_error).__name__,
+                                    error=str(finalize_error),
+                                )
+                            except BaseException as evidence_error:
+                                setattr(finalize_error, "evidence_error", evidence_error)
+                        if primary is not None:
+                            attribute = (
+                                "input_adapter_finalize_error"
+                                if getattr(
+                                    finalize_error,
+                                    "_predict_rlm_input_adapter_finalize",
+                                    False,
+                                )
+                                else "session_finalize_error"
+                            )
+                            setattr(primary, attribute, finalize_error)
+                        else:
+                            primary = finalize_error
+                            raise
+                    if finalize_cancellation is not None:
+                        if primary is not finalize_cancellation:
+                            setattr(primary, "session_finalize_cancellation", finalize_cancellation)
+            release_succeeded = True
+        except BaseException as release_or_primary:
+            if primary is release_or_primary:
+                release_succeeded = True
+            elif primary is not None:
+                setattr(primary, "session_release_error", release_or_primary)
+            else:
+                primary = release_or_primary
+            if session_name is None:
+                try:
+                    await self._finalize_runtime_inputs(ctx, None, primary)
+                except BaseException as finalize_error:
+                    setattr(primary, "input_adapter_finalize_error", finalize_error)
+                    await self._record_pre_session_finalize_failure(finalize_error)
+            if not release_succeeded and recorder is not None and session_name is not None:
+                try:
+                    await recorder.emit(
+                        RunEventKind.SESSION_RELEASE_FAILED,
+                        backend=session_name,
+                        error_type=type(release_or_primary).__name__,
+                        error=str(release_or_primary),
+                    )
+                except BaseException as evidence_error:
+                    setattr(primary, "release_evidence_error", evidence_error)
+            raise primary
+        else:
+            if primary is not None:
+                raise primary
+        finally:
+            ctx.session = None
+            if release_succeeded and recorder is not None and session_name is not None:
+                try:
+                    await recorder.emit(
+                        RunEventKind.SESSION_RELEASED,
+                        backend=session_name,
+                    )
+                except BaseException as release_evidence_error:
+                    if primary is not None:
+                        setattr(primary, "release_evidence_error", release_evidence_error)
+                    else:
+                        raise
 
     def _prepare_execution_tools(self) -> dict[str, Callable]:
         """Return only user-provided tools (including predict).
 
         Override parent to skip the default llm_query and llm_query_batched tools.
         """
-        return {name: tool.func for name, tool in self._user_tools.items()}
+        tools = self._runtime_tool_functions()
+        return {
+            name: function
+            if name == "predict"
+            else self._wrap_evidence_tool(name, function)
+            for name, function in tools.items()
+        }
+
+    def _wrap_evidence_tool(
+        self,
+        name: str,
+        function: Callable[..., Any],
+    ) -> Callable[..., Any]:
+        @functools.wraps(function)
+        async def dispatch(*args: Any, **kwargs: Any) -> Any:
+            recorder = self._evidence()
+            call_id = uuid.uuid4().hex
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.TOOL_STARTED,
+                    call_id=call_id,
+                    name=name,
+                    args=list(args),
+                    kwargs=kwargs,
+                )
+            try:
+                result = await invoke_host_callable(function, *args, **kwargs)
+            except BaseException as exc:
+                if recorder is not None:
+                    try:
+                        await recorder.emit(
+                            RunEventKind.TOOL_FINISHED,
+                            call_id=call_id,
+                            name=name,
+                            error_type=type(exc).__name__,
+                            error=str(exc),
+                            cancelled=isinstance(exc, asyncio.CancelledError),
+                        )
+                    except BaseException as evidence_error:
+                        setattr(exc, "evidence_error", evidence_error)
+                raise
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.TOOL_FINISHED,
+                    call_id=call_id,
+                    name=name,
+                    result=result,
+                )
+            return result
+
+        dispatch.__name__ = name
+        preserve_sync_leaf(dispatch, function)
+        return dispatch
+
+    def _debug_lm_metadata(self, metadata: Any | None) -> dict[str, Any]:
+        if metadata is None:
+            return {}
+        attrs: dict[str, Any] = {}
+        for source_name, target_name in (
+            ("finish_reason", "lm_finish_reason"),
+            ("truncation_reason", "lm_truncation_reason"),
+            ("max_tokens", "lm_max_tokens"),
+            ("input_tokens", "lm_prompt_tokens"),
+            ("cached_input_tokens", "lm_cached_prompt_tokens"),
+            ("cache_read_ratio", "lm_prompt_cache_read_ratio"),
+            ("output_tokens", "lm_output_tokens"),
+        ):
+            value = getattr(metadata, source_name, None)
+            if value is not None:
+                attrs[target_name] = value
+        truncated = getattr(metadata, "truncated", None)
+        if truncated is not None:
+            attrs["lm_truncated"] = truncated
+        return attrs
 
     @contextmanager
     def _lm_context(self):
         """Set the configured LM as active context and capture it for predict() calls."""
         context_kwargs: dict[str, Any] = {}
-        if self._lm is not None:
-            context_kwargs["lm"] = self._lm
+        run_ctx = current_run_context()
+        active_lm = run_ctx.state.get("lm") if run_ctx is not None else self._lm
+        if active_lm is not None:
+            context_kwargs["lm"] = active_lm
         if getattr(dspy.settings, "adapter", None) is None:
             context_kwargs["adapter"] = _ValidatingChatAdapter()
 
@@ -1588,6 +2478,137 @@ class PredictRLM(dspy.RLM):
         except Exception:
             return
 
+    def _process_execution_result(self, pred: Any, *args: Any) -> dspy.Prediction | Any:
+        original_verbose = self.verbose
+        self.verbose = False
+        try:
+            return super()._process_execution_result(pred, *args)
+        finally:
+            self.verbose = original_verbose
+
+    def _submit_payload_from_prediction(
+        self,
+        prediction: dspy.Prediction,
+        output_field_names: list[str],
+    ) -> dict[str, Any]:
+        return {
+            name: prediction.get(name)
+            for name in output_field_names
+            if name in prediction.keys()
+        }
+
+    def _iteration_logging_enabled(self) -> bool:
+        return bool(getattr(self, "verbose", False))
+
+    def _debug_logging_enabled(self) -> bool:
+        return bool(getattr(self, "_debug", False))
+
+    def _log_lifecycle(self, event: str, **fields: Any) -> None:
+        if self._debug_logging_enabled():
+            logger.debug("%s%s", event, format_log_fields(fields))
+
+    def _interpreter_backend_label(self, repl: Any) -> str:
+        if type(repl).__name__ == "SbxBackend":
+            return "sbx"
+        if isinstance(JspiBackend, type) and isinstance(repl, JspiBackend):
+            return "jspi"
+        return type(repl).__name__
+
+    def _configure_interpreter_debug(self, repl: Any) -> dict[str, bool]:
+        return self._configure_interpreter_logging(repl)
+
+    def _ensure_interpreter_skill_packages(self, repl: Any) -> bool:
+        packages = self._runtime_packages()
+        if not packages:
+            return False
+        ensure_skill_packages = self._declared_callable(repl, "ensure_skill_packages")
+        if ensure_skill_packages is None:
+            return False
+        ensure_skill_packages(list(packages))
+        return True
+
+    def _configure_interpreter_logging(self, repl: Any) -> dict[str, bool]:
+        configured = {"debug": False, "verbose": False}
+        debug_enabled = self._debug_logging_enabled()
+        verbose_enabled = self._iteration_logging_enabled()
+
+        configure_runtime = self._declared_callable(repl, "configure_runtime")
+        if configure_runtime is not None:
+            kwargs = self._accepted_kwargs(
+                configure_runtime,
+                debug=debug_enabled,
+                verbose=verbose_enabled,
+            )
+            if kwargs:
+                configure_runtime(**kwargs)
+                configured["debug"] = "debug" in kwargs
+                configured["verbose"] = "verbose" in kwargs
+
+        configure_debug = self._declared_callable(repl, "configure_debug")
+        if not configured["debug"] and configure_debug is not None:
+            configure_debug(debug_enabled)
+            configured["debug"] = True
+
+        configure_verbose = self._declared_callable(repl, "configure_verbose")
+        if not configured["verbose"] and configure_verbose is not None:
+            configure_verbose(verbose_enabled)
+            configured["verbose"] = True
+
+        return configured
+
+    def _declared_callable(self, obj: Any, name: str) -> Callable[..., Any] | None:
+        try:
+            inspect.getattr_static(obj, name)
+        except AttributeError:
+            return None
+        value = getattr(obj, name, None)
+        return value if callable(value) else None
+
+    def _accepted_kwargs(self, func: Callable[..., Any], **kwargs: Any) -> dict[str, Any]:
+        try:
+            parameters = inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            return kwargs
+        if any(param.kind is inspect.Parameter.VAR_KEYWORD for param in parameters.values()):
+            return kwargs
+        return {name: value for name, value in kwargs.items() if name in parameters}
+
+    def _begin_iteration_log(self, *, iteration: int, pred: Any, code: str) -> bool:
+        if not self._iteration_logging_enabled():
+            return False
+        configure_predict_rlm_logging(verbose=True)
+        execution_timeout = getattr(pred, "execution_timeout_seconds", None)
+        if isinstance(execution_timeout, bool) or not isinstance(
+            execution_timeout, (int, float)
+        ):
+            execution_timeout = None
+        emit_trace_iteration_start(
+            iteration=iteration + 1,
+            max_iterations=self.max_iterations,
+            reasoning=getattr(pred, "reasoning", "") or "",
+            code=code,
+            execution_timeout_seconds=execution_timeout,
+        )
+        return True
+
+    def _emit_iteration_output_log(self, result: Any) -> None:
+        if self._iteration_logging_enabled():
+            emit_trace_iteration_output("" if result is None else result)
+
+    def _emit_iteration_submit_log(
+        self,
+        prediction: dspy.Prediction,
+        output_field_names: list[str],
+    ) -> None:
+        if self._iteration_logging_enabled():
+            emit_trace_iteration_submit(
+                self._submit_payload_from_prediction(prediction, output_field_names)
+            )
+
+    def _finish_iteration_log(self, opened: bool) -> None:
+        if opened:
+            emit_trace_iteration_end()
+
     def _action_generation_error_attrs(
         self,
         exc: BaseException,
@@ -1644,6 +2665,18 @@ class PredictRLM(dspy.RLM):
             "code": "ERROR",
             "message": f"{type(exc).__name__}: action generation did not produce parsed code",
         }
+
+    def _action_execution_timeout(self, pred: Any) -> float | None:
+        value = getattr(pred, "execution_timeout_seconds", None)
+        if type(value).__module__ == "unittest.mock":
+            return None
+        try:
+            return validate_execution_timeout(value)
+        except ValueError as exc:
+            raise RuntimeError(
+                "PredictRLM action adapter returned invalid "
+                "execution_timeout_seconds; expected a positive number or null."
+            ) from exc
 
     def _telemetry_ref(self) -> dict[str, Any] | None:
         telemetry_context = getattr(self, "_current_telemetry_context", None)
@@ -1804,9 +2837,28 @@ class PredictRLM(dspy.RLM):
         the default bound for this call only.
         """
         fb_bound = self._pop_extract_fallback_bound(kwargs)
-        with self._lm_context():
-            file_plan, kwargs = self._prepare_file_io(kwargs)
-            return self._forward_traced(file_plan, fb_bound=fb_bound, **kwargs)
+        if type(self)._forward_traced is not _KERNEL_FORWARD_TRACED:
+            with self._lm_context():
+                return self._forward_traced(None, **kwargs)
+        bound_forward = getattr(self._aforward_traced, "__func__", None)
+        if bound_forward is not _KERNEL_AFORWARD_TRACED:
+            with self._lm_context():
+                result = self._aforward_traced(None, **kwargs)
+            return self._run_async(result) if inspect.isawaitable(result) else result
+        return self._run_async(
+            self._aforward_kernel(kwargs, sync_callbacks=True, fb_bound=fb_bound)
+        )
+
+    def _run_async(self, awaitable: Any) -> Any:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(awaitable)
+
+        import nest_asyncio
+
+        nest_asyncio.apply(loop)
+        return loop.run_until_complete(awaitable)
 
     def _pop_extract_fallback_bound(self, kwargs: dict[str, Any]) -> int:
         """Resolve this call's per-forward extract-fallback budget.
@@ -1814,27 +2866,70 @@ class PredictRLM(dspy.RLM):
         Pops a ``max_extract_fallbacks`` override out of ``kwargs`` (so it never
         leaks into signature-input validation) and returns the effective bound.
         Absent an override, the instance default applies. The value is returned,
-        not stored on the instance — per-forward state lives in a local
-        ``_ExtractFallbackState`` so concurrent forwards can't race.
+        not stored on the instance — per-forward state lives on the RunContext
+        (see :meth:`_current_extract_fallback_state`) so concurrent forwards
+        can't race.
         """
         override = kwargs.pop("max_extract_fallbacks", None)
         return self.max_extract_fallbacks if override is None else override
 
+    def _current_extract_fallback_state(self) -> "_ExtractFallbackState":
+        """Per-forward extract-fallback state, scoped to the active RunContext.
+
+        The kernel seeds this into ``ctx.state`` at run start; reading it here
+        keeps concurrent forwards on ONE instance from racing on a shared
+        counter/budget. Outside a run context (legacy subclass-overridden
+        ``_forward_traced`` paths) a fresh one-shot state with the instance
+        default applies — the fallback fires at most once per run, so this is
+        equivalent to per-forward state there.
+        """
+        ctx = current_run_context()
+        if ctx is not None:
+            state = ctx.state.get("extract_fallback")
+            if isinstance(state, _ExtractFallbackState):
+                return state
+            state = _ExtractFallbackState(
+                bound=getattr(self, "max_extract_fallbacks", 1)
+            )
+            ctx.state["extract_fallback"] = state
+            return state
+        state = _EXTRACT_FALLBACK_STATE.get()
+        if state is None:
+            state = _ExtractFallbackState(
+                bound=getattr(self, "max_extract_fallbacks", 1)
+            )
+            _EXTRACT_FALLBACK_STATE.set(state)
+        return state
+
+    def _seed_extract_fallback_state(self) -> None:
+        """Arm a fresh per-run fallback budget for a context-less traced run.
+
+        The kernel path seeds the state into the RunContext instead; this
+        covers direct ``_forward_traced``/``_aforward_traced`` calls (legacy
+        subclasses, tests). A ContextVar keeps concurrent direct aforwards
+        isolated: every asyncio Task runs in its own copied context, so each
+        run meters against its own state, never a shared instance attribute.
+        """
+        if current_run_context() is None:
+            _EXTRACT_FALLBACK_STATE.set(
+                _ExtractFallbackState(bound=getattr(self, "max_extract_fallbacks", 1))
+            )
+
     def _build_run_trace(
         self,
-        status: Literal["completed", "max_iterations", "error"],
+        status: Literal["in_progress", "completed", "max_iterations", "error"],
         steps: list[IterationStep],
         lm: Any,
         sub_lm: Any,
         lm_hist_start: int,
         sub_hist_start: int,
         run_start: float,
-        extract_fallbacks: int = 0,
+        extract_fallbacks: int | None = None,
     ) -> RunTrace:
         self._phase_log("build_run_trace:enter")
         trace_steps = steps
         pending_entry = getattr(self, "_partial_pending_entry", None)
-        if status == "error" and pending_entry is not None:
+        if status in {"in_progress", "error"} and pending_entry is not None:
             trace_steps = list(steps)
             pending_start = getattr(self, "_partial_pending_start", None)
             trace_steps.append(
@@ -1871,7 +2966,11 @@ class PredictRLM(dspy.RLM):
             sub_model=str(getattr(sub_lm, "model", sub_lm)) if sub_lm is not lm else None,
             iterations=len(trace_steps),
             max_iterations=self.max_iterations,
-            extract_fallbacks=extract_fallbacks,
+            extract_fallbacks=(
+                self._current_extract_fallback_state().count
+                if extract_fallbacks is None
+                else extract_fallbacks
+            ),
             extract_fallbacks_total=getattr(self, "_extract_fallback_count", 0),
             duration_ms=ms_since(run_start),
             usage=LMUsage(main=main_usage, **({"sub": sub_usage} if sub_usage else {})),
@@ -1895,6 +2994,142 @@ class PredictRLM(dspy.RLM):
             logger.warning("rlm_phase: %s (t=%s)", name, elapsed)
         except Exception:
             pass
+    def _export_current_trace(
+        self,
+        status: Literal["in_progress", "completed", "max_iterations", "error"],
+    ) -> None:
+        context = getattr(self, "_trace_export_context", None)
+        if context is None:
+            return
+        self._export_run_trace(
+            self._build_run_trace(
+                status=status,
+                steps=context.steps,
+                lm=context.lm,
+                sub_lm=context.sub_lm,
+                lm_hist_start=context.lm_hist_start,
+                sub_hist_start=context.sub_hist_start,
+                run_start=context.run_start,
+            )
+        )
+
+    def _export_run_trace(self, trace: RunTrace) -> None:
+        path = getattr(self, "_trace_export_path", None)
+        if path is None:
+            return
+        tmp_path: Path | None = None
+        try:
+            path = Path(path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+            tmp_path.write_text(trace.to_exportable_json(), encoding="utf-8")
+            os.replace(tmp_path, path)
+            tmp_path = None
+        except Exception as exc:
+            try:
+                self._log_lifecycle(
+                    "rlm.trace_export.error",
+                    error_type=type(exc).__name__,
+                    path=str(path),
+                )
+            except Exception:
+                pass
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    def _history_from_prediction(self, prediction: dspy.Prediction, fallback_history: Any):
+        from dspy.primitives.repl_types import REPLEntry, REPLHistory
+
+        entries = []
+        for item in getattr(prediction, "trajectory", None) or []:
+            if isinstance(item, REPLEntry):
+                entries.append(item)
+            elif isinstance(item, dict):
+                entries.append(
+                    REPLEntry(
+                        reasoning=item.get("reasoning", "") or "",
+                        code=item.get("code", "") or "",
+                        output=item.get("output", "") or "",
+                    )
+                )
+
+        if entries:
+            return REPLHistory(
+                entries=entries,
+                max_output_chars=getattr(fallback_history, "max_output_chars", 10_000),
+            )
+        return fallback_history
+
+    def _submitted_payload(
+        self,
+        prediction: dspy.Prediction,
+        output_field_names: list[str],
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {}
+        for name in output_field_names:
+            if hasattr(prediction, name):
+                payload[name] = getattr(prediction, name)
+        return payload
+
+    def _submit_confirmation_message(
+        self, context: SubmitConfirmationContext
+    ) -> str | None:
+        callback = getattr(self, "_submit_confirmation", None)
+        if callback is None:
+            return None
+        message = callback(context)
+        if message is None or message == "":
+            return None
+        if not isinstance(message, str):
+            raise TypeError(
+                "submit_confirmation must return a string, None, or an empty string."
+            )
+        return message
+
+    def _maybe_request_submit_confirmation(
+        self,
+        prediction: dspy.Prediction,
+        history: Any,
+        input_args: dict[str, Any],
+        output_field_names: list[str],
+        iteration: int,
+        pending: bool,
+    ):
+        if pending or getattr(self, "_submit_confirmation", None) is None:
+            return None
+
+        final_history = self._history_from_prediction(prediction, history)
+        latest_entry = final_history.entries[-1] if getattr(final_history, "entries", None) else None
+        latest_observation = latest_entry.output if latest_entry is not None else ""
+        context = SubmitConfirmationContext(
+            inputs=dict(input_args),
+            signature=self.signature,
+            output_field_names=tuple(output_field_names),
+            prediction=prediction,
+            submitted_payload=self._submitted_payload(prediction, output_field_names),
+            history=final_history,
+            latest_observation=latest_observation,
+            reasoning=(
+                latest_entry.reasoning
+                if latest_entry is not None
+                else getattr(prediction, "final_reasoning", "") or ""
+            ),
+            code=latest_entry.code if latest_entry is not None else "",
+            iteration=iteration + 1,
+        )
+        message = self._submit_confirmation_message(context)
+        if not message:
+            return None
+
+        return history.append(
+            reasoning=context.reasoning,
+            code=context.code,
+            output=message,
+        )
 
     async def aforward(self, **kwargs: Any) -> dspy.Prediction:
         """Async version of forward(). Sets the LM context for async execution.
@@ -1905,22 +3140,541 @@ class PredictRLM(dspy.RLM):
         Accepts an optional ``max_extract_fallbacks`` keyword that overrides
         the default bound for this call only.
         """
-        fb_bound = self._pop_extract_fallback_bound(kwargs)
-        self._context_lm = dspy.settings.lm
+        return await self._aforward_kernel(kwargs, sync_callbacks=False)
 
+    async def _aforward_kernel(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        sync_callbacks: bool,
+        fb_bound: int | None = None,
+    ) -> dspy.Prediction:
+        if fb_bound is None:
+            fb_bound = self._pop_extract_fallback_bound(kwargs)
+        ctx = self._new_run_context(kwargs)
+        ctx.state["sync_callbacks"] = sync_callbacks
+        ctx.state["extract_fallback"] = _ExtractFallbackState(bound=fb_bound)
+        recorder = EvidenceRecorder(ctx, self.runtime_spec.events)
+        ctx.state["evidence"] = recorder
+        async with use_run_context(ctx):
+            cleanup_complete = False
+            try:
+                await recorder.emit(
+                    RunEventKind.RUN_STARTED,
+                    inputs=dict(ctx.input_values),
+                )
+                await self._prepare_runtime_inputs(ctx, kwargs)
+                await self._prepare_runtime_outputs(ctx)
+                kwargs = {
+                    **kwargs,
+                    **{
+                        name: binding.prepared.model_value
+                        for name, binding in ctx.input_bindings.items()
+                    },
+                }
+                with self._lm_context():
+                    result = self._aforward_traced(None, **kwargs)
+                    prediction = await result if inspect.isawaitable(result) else result
+                await ctx.cleanup()
+                cleanup_complete = True
+            except BaseException as exc:
+                if not cleanup_complete:
+                    try:
+                        await ctx.cleanup()
+                    except BaseException as cleanup_error:
+                        setattr(exc, "cleanup_error", cleanup_error)
+                await recorder.finish_failure(exc)
+                self._attach_runtime_evidence(getattr(exc, "trace", None), recorder)
+                raise
+            else:
+                trace = getattr(prediction, "trace", None)
+                outputs = {
+                    name: getattr(prediction, name, None)
+                    for name in self.signature.output_fields
+                }
+                try:
+                    await recorder.finish_success(
+                        status=getattr(trace, "status", "completed"),
+                        outputs=outputs,
+                    )
+                except BaseException as exc:
+                    if trace is not None:
+                        trace.status = "error"
+                        setattr(exc, "trace", trace)
+                    self._attach_runtime_evidence(trace, recorder)
+                    raise
+                self._attach_runtime_evidence(trace, recorder)
+                return prediction
+
+    def _attach_runtime_evidence(
+        self,
+        trace: RunTrace | None,
+        recorder: EvidenceRecorder,
+    ) -> None:
+        if trace is None:
+            return
+        trace.evidence = RunEvidence(
+            run_id=recorder.ctx.run_id,
+            complete=recorder.complete,
+            terminal_outcome=recorder.ctx.terminal_outcome,
+            events=[
+                RunEvidenceEvent(
+                    sequence=event.sequence,
+                    kind=event.kind.value,
+                    timestamp_ns=event.timestamp_ns,
+                    data=dict(event.data),
+                )
+                for event in recorder.events
+            ],
+        )
+
+    @asynccontextmanager
+    async def _iteration_callback_scope_for_run(
+        self,
+        call_id: str | None,
+        iteration: int,
+    ) -> AsyncIterator[_IterationCallbackState]:
+        ctx = current_run_context()
+        if ctx is not None and ctx.state.get("sync_callbacks"):
+            with self._iteration_callback_scope(call_id, iteration) as state:
+                yield state
+            return
+        async with self._aiteration_callback_scope(call_id, iteration) as state:
+            yield state
+
+    async def _prepare_runtime_inputs(
+        self,
+        ctx: RunContext,
+        input_values: dict[str, Any],
+    ) -> None:
+        recorder = self._evidence()
+        for field_name, field_info in self.signature.input_fields.items():
+            if field_name not in input_values:
+                continue
+            value = input_values[field_name]
+            field = FieldDescriptor(field_name, field_info.annotation)
+            adapter = resolve_input_adapter(
+                self.runtime_spec.input_adapters,
+                field,
+                value,
+            )
+            prepared = compile_prepared_input(
+                field,
+                await adapter.prepare(field, value, ctx),
+            )
+            ctx.input_bindings[field_name] = PreparedInputBinding(
+                field=field,
+                adapter=adapter,
+                prepared=prepared,
+            )
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.INPUT_PREPARED,
+                    field=field_name,
+                    adapter=adapter.name,
+                    artifact_ids=[artifact.id for artifact in prepared.artifacts],
+                )
+
+    async def _open_runtime_inputs(self, ctx: RunContext) -> None:
+        for binding in ctx.input_bindings.values():
+            if binding.open_entered:
+                continue
+            binding.open_entered = True
+            try:
+                await binding.adapter.open(
+                    binding.field,
+                    binding.prepared,
+                    ctx,
+                    self.runtime_spec.execution,
+                )
+            except BaseException as exc:
+                try:
+                    await self._finalize_runtime_inputs(ctx, None, exc)
+                except BaseException as finalize_error:
+                    setattr(exc, "input_adapter_finalize_error", finalize_error)
+                    await self._record_pre_session_finalize_failure(finalize_error)
+                raise
+
+    async def _record_pre_session_finalize_failure(
+        self,
+        finalize_error: BaseException,
+    ) -> None:
+        recorder = self._evidence()
+        if recorder is None:
+            return
+        recorder.mark_incomplete(finalize_error)
         try:
-            file_plan, kwargs = self._prepare_file_io(kwargs)
-            with self._lm_context():
-                return await self._aforward_traced(file_plan, fb_bound=fb_bound, **kwargs)
-        finally:
-            self._context_lm = None
+            await recorder.emit(
+                RunEventKind.SESSION_FINALIZE_FAILED,
+                backend=self.runtime_spec.execution.name,
+                error_type=type(finalize_error).__name__,
+                error=str(finalize_error),
+            )
+        except BaseException as evidence_error:
+            setattr(finalize_error, "evidence_error", evidence_error)
 
-    def _begin_action_generation(self, iteration: int) -> tuple[int, int]:
-        """Open the action-generation span and snapshot LM history.
+    async def _prepare_runtime_outputs(self, ctx: RunContext) -> None:
+        for field_name, field_info in self.signature.output_fields.items():
+            field = FieldDescriptor(field_name, field_info.annotation)
+            matches = [
+                adapter
+                for adapter in self.runtime_spec.output_adapters
+                if adapter.supports(field)
+            ]
+            if not matches:
+                continue
+            adapter = resolve_output_adapter(matches, field)
+            requirements = await adapter.prepare_session(
+                field,
+                ctx.input_values.get(field_name),
+                ctx,
+            )
+            if requirements is not None:
+                if not isinstance(requirements, SessionRequirements):
+                    raise TypeError(
+                        "OutputAdapter.prepare_session() must return "
+                        "SessionRequirements or None"
+                    )
+                ctx.output_requirements[field_name] = requirements
 
-        Returns ``(span_start_ns, lm_history_len)`` — both needed by whichever
-        of ``_record_action_error`` / ``_record_action_ok`` closes the span.
-        """
+    async def _bind_runtime_inputs(self, ctx: RunContext) -> None:
+        recorder = self._evidence()
+        session = ctx.session
+        if session is None:
+            raise RuntimeError("Artifact binding requires an active execution session")
+        for binding in ctx.input_bindings.values():
+            if binding.bound:
+                continue
+            binding.bound = True
+            ctx.bound_input_bindings.append(binding)
+            bound = await binding.adapter.bind(
+                binding.field,
+                binding.prepared,
+                ctx,
+                session,
+            )
+            for artifact_binding in bound.bindings:
+                ctx.bind(artifact_binding)
+                if recorder is not None:
+                    await recorder.emit(
+                        RunEventKind.ARTIFACT_MOUNTED,
+                        artifact_id=artifact_binding.artifact_id,
+                        path=artifact_binding.path,
+                    )
+            if bound.model_value != binding.prepared.model_value:
+                binding.prepared = replace(
+                    binding.prepared,
+                    model_value=bound.model_value,
+                )
+
+    async def _run_session_code(
+        self,
+        ctx: RunContext,
+        code: str,
+        variables: Mapping[str, Any] | None = None,
+        *,
+        timeout: float | None = None,
+    ) -> ExecutionResult:
+        session = ctx.session
+        if session is None:
+            raise RuntimeError("Input lifecycle requires an active execution session")
+        result: ExecutionResult | None = None
+        execution_error: BaseException | None = None
+        try:
+            result = await session.run_code(code, variables, timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            execution_error = exc
+
+        await self._after_runtime_input_execution(ctx, result, execution_error)
+        if execution_error is not None:
+            raise execution_error
+        assert result is not None
+        return result
+
+    async def _after_runtime_input_execution(
+        self,
+        ctx: RunContext,
+        result: ExecutionResult | None,
+        execution_error: BaseException | None,
+    ) -> None:
+        session = ctx.session
+        if session is None:
+            raise RuntimeError("Input lifecycle requires an active execution session")
+        after_error: BaseException | None = None
+        additional_errors = []
+        for binding in ctx.bound_input_bindings:
+            try:
+                await binding.adapter.after_execution(
+                    binding.field,
+                    binding.prepared,
+                    ctx,
+                    session,
+                    result,
+                    execution_error,
+                )
+            except BaseException as exc:
+                if after_error is None:
+                    after_error = exc
+                else:
+                    additional_errors.append(exc)
+
+        if after_error is not None and additional_errors:
+            setattr(
+                after_error,
+                "input_adapter_after_execution_errors",
+                tuple(additional_errors),
+            )
+        if after_error is not None:
+            setattr(after_error, "_predict_rlm_input_adapter_after_execution", True)
+            if execution_error is not None:
+                setattr(
+                    execution_error,
+                    "input_adapter_after_execution_error",
+                    after_error,
+                )
+                setattr(
+                    execution_error,
+                    "_predict_rlm_input_adapter_after_execution",
+                    True,
+                )
+                return
+            raise after_error
+
+    async def _finalize_runtime_inputs(
+        self,
+        ctx: RunContext,
+        session: Any | None,
+        error: BaseException | None,
+    ) -> None:
+        adapter_error: BaseException | None = None
+        additional_errors = []
+        for binding in reversed(tuple(ctx.input_bindings.values())):
+            if not binding.open_entered or binding.finalized:
+                continue
+            binding.finalized = True
+            try:
+                await binding.adapter.finalize(
+                    binding.field,
+                    binding.prepared,
+                    ctx,
+                    session,
+                    error,
+                )
+            except BaseException as exc:
+                if adapter_error is None:
+                    adapter_error = exc
+                else:
+                    additional_errors.append(exc)
+        session_error: BaseException | None = None
+        if session is not None and not ctx.session_finalized:
+            ctx.session_finalized = True
+            try:
+                await session.finalize()
+            except BaseException as exc:
+                session_error = exc
+        if adapter_error is not None:
+            setattr(adapter_error, "_predict_rlm_input_adapter_finalize", True)
+            if additional_errors:
+                setattr(adapter_error, "input_finalize_errors", tuple(additional_errors))
+            if session_error is not None:
+                setattr(adapter_error, "session_finalize_error", session_error)
+            raise adapter_error
+        if session_error is not None:
+            raise session_error
+
+    def _configure_run_predictors(
+        self,
+        ctx: RunContext,
+        file_plan: dict[str, Any] | None,
+    ) -> None:
+        prepared_instructions = tuple(
+            instruction
+            for binding in ctx.input_bindings.values()
+            for instruction in binding.prepared.instructions
+        )
+        file_instructions = file_plan["instructions"] if file_plan else ""
+        output_instructions = tuple(
+            f"Output `{field_name}` is reserved as {reservation.model_value!r}."
+            for field_name, reservation in ctx.output_reservations.items()
+        )
+        invocation_instructions = "\n\n".join(
+            instruction
+            for instruction in (
+                file_instructions,
+                *prepared_instructions,
+                *output_instructions,
+            )
+            if instruction
+        )
+        prompt_signature = dspy.Signature(
+            deepcopy(self.signature.fields),
+            str(self.signature.instructions),
+        )
+        has_prompt_signature_transform = False
+        for binding in ctx.input_bindings.values():
+            transform_prompt_signature = binding.adapter._transform_prompt_signature
+            has_prompt_signature_transform |= (
+                getattr(transform_prompt_signature, "__func__", transform_prompt_signature)
+                is not InputAdapter._transform_prompt_signature
+            )
+            prompt_signature = transform_prompt_signature(
+                prompt_signature, binding.field, binding.prepared, ctx
+            )
+            if not (
+                isinstance(prompt_signature, type)
+                and issubclass(prompt_signature, dspy.Signature)
+            ):
+                raise TypeError(
+                    f"Input adapter {binding.adapter.name!r} "
+                    "_transform_prompt_signature must return a dspy.Signature class"
+                )
+
+        if not has_prompt_signature_transform:
+            if invocation_instructions:
+                action, extract = self._build_signatures_with_files(invocation_instructions)
+            else:
+                action, extract = self.generate_action, self.extract
+        else:
+            token = _RUN_PROMPT_SIGNATURE.set((self, prompt_signature))
+            try:
+                action, extract = self._build_signatures_with_files(invocation_instructions)
+            finally:
+                _RUN_PROMPT_SIGNATURE.reset(token)
+
+        for binding in ctx.input_bindings.values():
+            action = self._with_adapter_prompt(action, binding, ctx)
+            extract = self._with_adapter_prompt(extract, binding, ctx)
+
+        ctx.state["generate_action"] = action
+        ctx.state["extract"] = extract
+
+    def _with_adapter_prompt(
+        self,
+        predictor: dspy.Predict,
+        binding: PreparedInputBinding,
+        ctx: RunContext,
+    ) -> dspy.Predict:
+        append_prompt = binding.adapter.append_prompt
+        if (
+            getattr(append_prompt, "__func__", append_prompt)
+            is InputAdapter.append_prompt
+        ):
+            return predictor
+        prompt = str(predictor.signature.instructions)
+        transformed = append_prompt(prompt, binding.field, binding.prepared, ctx)
+        if not isinstance(transformed, str):
+            raise TypeError(
+                f"Input adapter {binding.adapter.name!r} append_prompt must return str"
+            )
+        if transformed == prompt:
+            return predictor
+        run_predictor = predictor.deepcopy()
+        run_predictor.signature = predictor.signature.with_instructions(transformed)
+        return run_predictor
+
+
+    async def _setup_runtime_modules(self, ctx: RunContext) -> None:
+        session = ctx.session
+        if session is None:
+            return
+        if not self._skill_modules:
+            return
+        for module_name, source_path in self._skill_modules.items():
+            artifact = Artifact(
+                id=f"skill-module-{module_name}-{ctx.run_id}",
+                kind="compat.module",
+                metadata={
+                    "source_path": source_path,
+                    "sandbox_path": f"/sandbox/lib/{module_name}.py",
+                },
+            )
+            binding = await session.mount(artifact)
+            ctx.bind(binding)
+        await session.run_code(
+            "import sys; sys.path.insert(0, '/sandbox/lib')",
+        )
+
+    async def _reserve_runtime_outputs(self, ctx: RunContext) -> None:
+        session = ctx.session
+        if session is None:
+            raise RuntimeError("Output reservation requires an active execution session")
+        recorder = self._evidence()
+        for field_name, field_info in self.signature.output_fields.items():
+            field = FieldDescriptor(field_name, field_info.annotation)
+            matches = [
+                adapter
+                for adapter in self.runtime_spec.output_adapters
+                if adapter.supports(field)
+            ]
+            if not matches:
+                continue
+            adapter = resolve_output_adapter(matches, field)
+            reservation = await adapter.reserve(
+                field,
+                ctx.input_values.get(field_name),
+                ctx,
+                session,
+            )
+            if reservation.field != field:
+                raise ValueError(
+                    f"Output adapter {adapter.name!r} reserved field "
+                    f"{reservation.field.name!r} while preparing {field.name!r}"
+                )
+            validate_output_sandbox_root_reservation(
+                ctx.input_bindings,
+                ctx.output_reservations,
+                reservation,
+            )
+            ctx.reserve(reservation, adapter)
+            if recorder is not None:
+                binding = ctx.artifact_bindings.get(reservation.artifact.id)
+                if binding is not None:
+                    await recorder.emit(
+                        RunEventKind.ARTIFACT_MOUNTED,
+                        artifact_id=reservation.artifact.id,
+                        path=binding.path,
+                    )
+                await recorder.emit(
+                    RunEventKind.OUTPUT_RESERVED,
+                    field=field_name,
+                    adapter=adapter.name,
+                    artifact_id=reservation.artifact.id,
+                )
+
+    async def _materialize_runtime_outputs(
+        self,
+        ctx: RunContext,
+        prediction: dspy.Prediction,
+    ) -> None:
+        session = ctx.session
+        if session is None:
+            raise RuntimeError("Output materialization requires an active execution session")
+        recorder = self._evidence()
+        for field_name, reservation in ctx.output_reservations.items():
+            adapter = ctx.output_adapters[field_name]
+            value = await adapter.materialize(
+                reservation,
+                getattr(prediction, field_name, None),
+                ctx,
+                session,
+            )
+            setattr(prediction, field_name, value)
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.ARTIFACT_COLLECTED,
+                    artifact_id=reservation.artifact.id,
+                    field=field_name,
+                )
+                await recorder.emit(
+                    RunEventKind.OUTPUT_MATERIALIZED,
+                    field=field_name,
+                    adapter=adapter.name,
+                )
+
+    def _begin_action_generation(self, variables, iteration: int) -> tuple[list[str], int]:
+        variables_info = [variable.format() for variable in variables]
         action_start_ns = time.time_ns()
         self._write_telemetry_span(
             "rlm.action_generation.start",
@@ -1928,19 +3682,14 @@ class PredictRLM(dspy.RLM):
             start_time_unix_nano=action_start_ns,
             end_time_unix_nano=action_start_ns,
         )
-        return action_start_ns, snapshot_lm_history_len(dspy.settings.lm)
-
-    def _action_kwargs(self, variables, history, iteration: int) -> dict[str, Any]:
-        """Inputs for the action predictor, shared by both call styles."""
-        return dict(
-            variables_info=[variable.format() for variable in variables],
-            repl_history=history,
-            iteration=f"{iteration + 1}/{self.max_iterations}",
+        self._log_lifecycle(
+            "rlm.action_generation.start",
+            iteration=iteration + 1,
+            max_iterations=self.max_iterations,
         )
+        return variables_info, action_start_ns
 
-    @staticmethod
-    def _validate_action(pred: Any) -> None:
-        """Reject an adapter response the REPL loop can't act on."""
+    def _validate_iteration_action(self, pred: Any) -> None:
         if not isinstance(getattr(pred, "reasoning", None), str):
             raise RuntimeError(
                 "PredictRLM action adapter returned invalid reasoning; "
@@ -1952,8 +3701,13 @@ class PredictRLM(dspy.RLM):
                 "expected a validated non-empty string."
             )
 
-    def _record_action_error(
-        self, exc: BaseException, iteration: int, action_start_ns: int, hist_before: int
+    def _record_action_generation_error(
+        self,
+        exc: BaseException,
+        *,
+        iteration: int,
+        action_start_ns: int,
+        lm_metadata: Any,
     ) -> None:
         self._write_telemetry_span(
             "rlm.action_generation.parse_error",
@@ -1961,16 +3715,25 @@ class PredictRLM(dspy.RLM):
             status=self._action_generation_error_status(exc),
             attributes=self._action_generation_error_attrs(
                 exc,
-                lm_metadata=lm_completion_metadata_since(dspy.settings.lm, hist_before),
+                lm_metadata=lm_metadata,
             ),
             start_time_unix_nano=action_start_ns,
         )
+        self._log_lifecycle(
+            "rlm.action_generation.error",
+            iteration=iteration + 1,
+            error_type=type(exc).__name__,
+        )
 
-    def _record_action_ok(
-        self, pred: Any, iteration: int, action_start_ns: int, hist_before: int
+    def _record_action_generation_ok(
+        self,
+        pred: Any,
+        *,
+        iteration: int,
+        action_start_ns: int,
+        lm_hist_before_action: int,
+        execution_timeout: float | None,
     ) -> Any:
-        """Close the action span and return the call's LM metadata."""
-        lm_metadata = lm_finish_since(dspy.settings.lm, hist_before)
         self._write_telemetry_span(
             "rlm.action_generation.ok",
             iteration=iteration + 1,
@@ -1979,27 +3742,32 @@ class PredictRLM(dspy.RLM):
                 "has_code": True,
                 "code_chars": len(getattr(pred, "code", "") or ""),
                 "reasoning_chars": len(getattr(pred, "reasoning", "") or ""),
+                **(
+                    {"execution_timeout_seconds": execution_timeout}
+                    if execution_timeout is not None
+                    else {}
+                ),
             },
         )
-        return lm_metadata
+        self._log_lifecycle(
+            "rlm.action_generation.ok",
+            iteration=iteration + 1,
+            code_chars=len(getattr(pred, "code", "") or ""),
+            reasoning_chars=len(getattr(pred, "reasoning", "") or ""),
+            execution_timeout_seconds=execution_timeout,
+        )
+        self._last_action_lm_usage = usage_since(dspy.settings.lm, lm_hist_before_action)
+        return lm_finish_since(dspy.settings.lm, lm_hist_before_action)
 
-    def _prepare_iteration_code(self, pred: Any, iteration: int) -> str:
-        """Extract the code to run and arm partial-trajectory capture.
-
-        Reasoning+code are captured BEFORE executing so a mid-execution
-        cancellation still leaves this iteration visible in the partial
-        trajectory (output will be empty / placeholder).
-        """
-        if self.verbose:
-            import logging as _logging
-
-            _logging.getLogger("dspy.predict.rlm").info(
-                f"RLM iteration {iteration + 1}/{self.max_iterations}\n"
-                f"Reasoning: {pred.reasoning}\nCode:\n{pred.code}"
-            )
-
-        code = _strip_code_fences(pred.code or "")
+    def _prepare_iteration_execution(self, pred: Any, iteration: int) -> tuple[str, bool]:
+        code = pred.code or ""
+        code = strip_code_fences(code)
         self._write_generated_code_event(iteration=iteration, pred=pred, code=code)
+        iteration_log_open = self._begin_iteration_log(
+            iteration=iteration,
+            pred=pred,
+            code=code,
+        )
 
         from dspy.primitives.repl_types import REPLEntry
 
@@ -2009,17 +3777,278 @@ class PredictRLM(dspy.RLM):
             output="",
         )
         self._partial_pending_start = time.perf_counter()
-        return code
+        self._export_current_trace("in_progress")
+        return code, iteration_log_open
 
-    def _finish_iteration(
-        self, pred, code, result, history, output_field_names, lm_metadata
-    ):
-        """Fold an execution result into the REPL history and disarm capture.
+    def _log_iteration_execute_start(self, repl: Any, *, iteration: int, code: str) -> float:
+        execute_start = time.perf_counter()
+        self._log_lifecycle(
+            "rlm.execute.start",
+            backend=self._interpreter_backend_label(repl),
+            iteration=iteration + 1,
+            code_chars=len(code),
+        )
+        return execute_start
 
-        step_result is either a new REPLHistory (iteration continues) or a
-        dspy.Prediction (SUBMIT happened). Only the former gets a history
-        snapshot, but both mean execution is no longer in flight.
-        """
+    def _log_iteration_execute_fatal(
+        self,
+        repl: Any,
+        *,
+        iteration: int,
+        execute_start: float,
+        exc: BaseException,
+    ) -> None:
+        self._log_lifecycle(
+            "rlm.execute.fatal",
+            backend=self._interpreter_backend_label(repl),
+            iteration=iteration + 1,
+            duration_ms=ms_since(execute_start),
+            error_type=type(exc).__name__,
+        )
+
+    def _format_iteration_execute_error(
+        self,
+        repl: Any,
+        *,
+        iteration: int,
+        execute_start: float,
+        code: str,
+        exc: BaseException,
+    ) -> str:
+        result = _format_execution_error(code, exc)
+        self._log_lifecycle(
+            "rlm.execute.error",
+            backend=self._interpreter_backend_label(repl),
+            iteration=iteration + 1,
+            duration_ms=ms_since(execute_start),
+            error_type=type(exc).__name__,
+        )
+        return result
+
+    def _log_iteration_execute_ok(
+        self,
+        repl: Any,
+        *,
+        iteration: int,
+        execute_start: float,
+        result: Any,
+    ) -> None:
+        self._log_lifecycle(
+            "rlm.execute.ok",
+            backend=self._interpreter_backend_label(repl),
+            iteration=iteration + 1,
+            duration_ms=ms_since(execute_start),
+            final=isinstance(result, FinalOutput),
+        )
+
+    def _execute_iteration_code(
+        self,
+        repl: Any,
+        *,
+        code: str,
+        input_args: dict[str, Any],
+        iteration: int,
+        iteration_log_open: bool,
+        execution_timeout: float | None,
+    ) -> Any:
+        execute_start = self._log_iteration_execute_start(
+            repl,
+            iteration=iteration,
+            code=code,
+        )
+        try:
+            with (
+                live_tool_call_logging(iteration_log_open),
+                suppress_interpreter_result_logging(iteration_log_open),
+            ):
+                if (
+                    getattr(self, "_submit_confirmation", None) is not None
+                    and not getattr(self, "_pending_submit_confirmation", False)
+                    and hasattr(repl, "defer_next_submit_finalization")
+                ):
+                    repl.defer_next_submit_finalization()
+                if execution_timeout is None:
+                    result = repl.execute(code, variables=dict(input_args))
+                else:
+                    result = repl.execute(
+                        code,
+                        variables=dict(input_args),
+                        timeout=execution_timeout,
+                    )
+        except (SandboxFatalError, ExecutionFatalError) as exc:
+            self._log_iteration_execute_fatal(
+                repl,
+                iteration=iteration,
+                execute_start=execute_start,
+                exc=exc,
+            )
+            raise
+        except (CodeInterpreterError, SyntaxError) as exc:
+            return self._format_iteration_execute_error(
+                repl,
+                iteration=iteration,
+                execute_start=execute_start,
+                code=code,
+                exc=exc,
+            )
+        self._log_iteration_execute_ok(
+            repl,
+            iteration=iteration,
+            execute_start=execute_start,
+            result=result,
+        )
+        return result
+
+    async def _aexecute_iteration_code(
+        self,
+        repl: Any,
+        *,
+        code: str,
+        input_args: dict[str, Any],
+        iteration: int,
+        iteration_log_open: bool,
+        execution_timeout: float | None,
+    ) -> Any:
+        execute_start = self._log_iteration_execute_start(
+            repl,
+            iteration=iteration,
+            code=code,
+        )
+        recorder = self._evidence()
+        operation_id = uuid.uuid4().hex
+        if recorder is not None:
+            await recorder.emit(
+                RunEventKind.CODE_GENERATED,
+                operation_id=operation_id,
+                iteration=iteration + 1,
+                code=code,
+            )
+        try:
+            with (
+                live_tool_call_logging(iteration_log_open),
+                suppress_interpreter_result_logging(iteration_log_open),
+            ):
+                if (
+                    getattr(self, "_submit_confirmation", None) is not None
+                    and not getattr(self, "_pending_submit_confirmation", False)
+                    and hasattr(repl, "defer_next_submit_finalization")
+                ):
+                    repl.defer_next_submit_finalization()
+                if hasattr(repl, "aexecute"):
+                    if execution_timeout is None:
+                        result = await repl.aexecute(code, variables=dict(input_args))
+                    else:
+                        result = await repl.aexecute(
+                            code,
+                            variables=dict(input_args),
+                            timeout=execution_timeout,
+                        )
+                else:
+                    if execution_timeout is None:
+                        result = repl.execute(code, variables=dict(input_args))
+                    else:
+                        result = repl.execute(
+                            code,
+                            variables=dict(input_args),
+                            timeout=execution_timeout,
+                        )
+        except asyncio.CancelledError as exc:
+            if recorder is not None:
+                try:
+                    await recorder.emit(
+                        RunEventKind.CODE_EXECUTED,
+                        operation_id=operation_id,
+                        iteration=iteration + 1,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        cancelled=True,
+                        fatal=False,
+                    )
+                except BaseException as evidence_error:
+                    setattr(exc, "evidence_error", evidence_error)
+            raise
+        except (SandboxFatalError, ExecutionFatalError) as exc:
+            self._log_iteration_execute_fatal(
+                repl,
+                iteration=iteration,
+                execute_start=execute_start,
+                exc=exc,
+            )
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.CODE_EXECUTED,
+                    operation_id=operation_id,
+                    iteration=iteration + 1,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    fatal=True,
+                )
+            raise
+        except Exception as exc:
+            if getattr(exc, "_predict_rlm_input_adapter_after_execution", False):
+                self._log_iteration_execute_fatal(
+                    repl,
+                    iteration=iteration,
+                    execute_start=execute_start,
+                    exc=exc,
+                )
+                if recorder is not None:
+                    await recorder.emit(
+                        RunEventKind.CODE_EXECUTED,
+                        operation_id=operation_id,
+                        iteration=iteration + 1,
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        fatal=True,
+                    )
+                raise
+            output = self._format_iteration_execute_error(
+                repl,
+                iteration=iteration,
+                execute_start=execute_start,
+                code=code,
+                exc=exc,
+            )
+            if recorder is not None:
+                await recorder.emit(
+                    RunEventKind.CODE_EXECUTED,
+                    operation_id=operation_id,
+                    iteration=iteration + 1,
+                    output=output,
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                    fatal=False,
+                )
+            return output
+        self._log_iteration_execute_ok(
+            repl,
+            iteration=iteration,
+            execute_start=execute_start,
+            result=result,
+        )
+        if recorder is not None:
+            await recorder.emit(
+                RunEventKind.CODE_EXECUTED,
+                operation_id=operation_id,
+                iteration=iteration + 1,
+                output=str(result),
+                final=isinstance(result, FinalOutput),
+            )
+        return result
+
+    def _complete_iteration_execution(
+        self,
+        pred: Any,
+        *,
+        code: str,
+        result: Any,
+        history: Any,
+        output_field_names: list[str],
+        lm_metadata: Any,
+    ) -> Any:
+        if not isinstance(result, FinalOutput):
+            self._emit_iteration_output_log(result)
+
         if _PARENT_TAKES_CODE:
             step_result = self._process_execution_result(
                 pred, code, result, history, output_field_names
@@ -2028,7 +4057,9 @@ class PredictRLM(dspy.RLM):
             step_result = self._process_execution_result(
                 pred, result, history, output_field_names
             )
-        if not isinstance(step_result, dspy.Prediction):
+        if isinstance(step_result, dspy.Prediction):
+            self._emit_iteration_submit_log(step_result, output_field_names)
+        else:
             self._partial_history = step_result
         self._partial_pending_entry = None
         self._partial_pending_start = None
@@ -2045,30 +4076,62 @@ class PredictRLM(dspy.RLM):
         output_field_names,
     ):
         """Execute one synchronous RLM iteration with PredictRLM validation."""
-        action_start_ns, hist_before = self._begin_action_generation(iteration)
+        variables_info, action_start_ns = self._begin_action_generation(
+            variables,
+            iteration,
+        )
         try:
-            pred = self.generate_action(
-                **self._action_kwargs(variables, history, iteration)
+            lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
+            run_ctx = current_run_context()
+            generate_action = (
+                run_ctx.state.get("generate_action", self.generate_action)
+                if run_ctx is not None
+                else self.generate_action
             )
-            self._validate_action(pred)
+            pred = generate_action(
+                variables_info=variables_info,
+                repl_history=history,
+                iteration=f"{iteration + 1}/{self.max_iterations}",
+            )
+            self._validate_iteration_action(pred)
+            execution_timeout = self._action_execution_timeout(pred)
         except BaseException as exc:
-            self._record_action_error(exc, iteration, action_start_ns, hist_before)
+            lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
+            self._record_action_generation_error(
+                exc,
+                iteration=iteration,
+                action_start_ns=action_start_ns,
+                lm_metadata=lm_metadata,
+            )
             raise
-        lm_metadata = self._record_action_ok(
-            pred, iteration, action_start_ns, hist_before
+        lm_metadata = self._record_action_generation_ok(
+            pred,
+            iteration=iteration,
+            action_start_ns=action_start_ns,
+            lm_hist_before_action=lm_hist_before_action,
+            execution_timeout=execution_timeout,
         )
-        code = self._prepare_iteration_code(pred, iteration)
+        code, iteration_log_open = self._prepare_iteration_execution(pred, iteration)
 
         try:
-            result = repl.execute(code, variables=dict(input_args))
-        except SandboxFatalError:
-            raise
-        except (CodeInterpreterError, SyntaxError) as e:
-            result = _format_execution_error(code, e)
-
-        return self._finish_iteration(
-            pred, code, result, history, output_field_names, lm_metadata
-        )
+            result = self._execute_iteration_code(
+                repl,
+                code=code,
+                input_args=input_args,
+                iteration=iteration,
+                iteration_log_open=iteration_log_open,
+                execution_timeout=execution_timeout,
+            )
+            return self._complete_iteration_execution(
+                pred,
+                code=code,
+                result=result,
+                history=history,
+                output_field_names=output_field_names,
+                lm_metadata=lm_metadata,
+            )
+        finally:
+            self._finish_iteration_log(iteration_log_open)
 
     async def _aexecute_iteration(
         self,
@@ -2081,44 +4144,132 @@ class PredictRLM(dspy.RLM):
     ):
         """Async twin of :meth:`_execute_iteration`.
 
-        Two deliberate divergences from the sync path, which is why these
-        skeletons stay separate (everything else routes through the same
-        helpers):
-
-        - It prefers the interpreter's non-blocking ``aexecute()``. The
-          parent's ``repl.execute()`` blocks the event loop and serializes
-          every concurrent rollout; ``execute`` remains the fallback for
-          interpreters that don't implement the async face.
-        - It converts ANY non-fatal exception into a REPL error string, not
-          just ``CodeInterpreterError``/``SyntaxError``, since the async
-          transport surfaces a wider set of failures.
+        The parent calls repl.execute() synchronously which blocks the event
+        loop, serializing all concurrent rollouts. This override uses
+        repl.aexecute() (available on JspiBackend) so the event loop
+        stays free for other coroutines.
         """
-        action_start_ns, hist_before = self._begin_action_generation(iteration)
-        try:
-            pred = await self.generate_action.acall(
-                **self._action_kwargs(variables, history, iteration)
+        bound_iteration = getattr(self._execute_iteration, "__func__", None)
+        if bound_iteration is not _KERNEL_EXECUTE_ITERATION:
+            return self._execute_iteration(
+                repl,
+                variables,
+                history,
+                iteration,
+                input_args,
+                output_field_names,
             )
-            self._validate_action(pred)
-        except BaseException as exc:
-            self._record_action_error(exc, iteration, action_start_ns, hist_before)
-            raise
-        lm_metadata = self._record_action_ok(
-            pred, iteration, action_start_ns, hist_before
+        variables_info, action_start_ns = self._begin_action_generation(
+            variables,
+            iteration,
         )
-        code = self._prepare_iteration_code(pred, iteration)
+        try:
+            lm_hist_before_action = snapshot_lm_history_len(dspy.settings.lm)
+            run_ctx = current_run_context()
+            generate_action = (
+                run_ctx.state.get("generate_action", self.generate_action)
+                if run_ctx is not None
+                else self.generate_action
+            )
+            action_kwargs = {
+                "variables_info": variables_info,
+                "repl_history": history,
+                "iteration": f"{iteration + 1}/{self.max_iterations}",
+            }
+            if inspect.iscoroutinefunction(getattr(generate_action, "acall", None)):
+                pred = await generate_action.acall(**action_kwargs)
+            else:
+                pred = generate_action(**action_kwargs)
+            self._validate_iteration_action(pred)
+            execution_timeout = self._action_execution_timeout(pred)
+        except BaseException as exc:
+            lm_metadata = lm_completion_metadata_since(dspy.settings.lm, lm_hist_before_action)
+            self._record_action_generation_error(
+                exc,
+                iteration=iteration,
+                action_start_ns=action_start_ns,
+                lm_metadata=lm_metadata,
+            )
+            raise
+        lm_metadata = self._record_action_generation_ok(
+            pred,
+            iteration=iteration,
+            action_start_ns=action_start_ns,
+            lm_hist_before_action=lm_hist_before_action,
+            execution_timeout=execution_timeout,
+        )
+        code, iteration_log_open = self._prepare_iteration_execution(pred, iteration)
 
         try:
-            if hasattr(repl, "aexecute"):
-                result = await repl.aexecute(code, variables=dict(input_args))
-            else:
-                result = repl.execute(code, variables=dict(input_args))
-        except SandboxFatalError:
-            raise
-        except Exception as e:
-            result = _format_execution_error(code, e)
+            result = await self._aexecute_iteration_code(
+                repl,
+                code=code,
+                input_args=input_args,
+                iteration=iteration,
+                iteration_log_open=iteration_log_open,
+                execution_timeout=execution_timeout,
+            )
+            return self._complete_iteration_execution(
+                pred,
+                code=code,
+                result=result,
+                history=history,
+                output_field_names=output_field_names,
+                lm_metadata=lm_metadata,
+            )
+        finally:
+            self._finish_iteration_log(iteration_log_open)
 
-        return self._finish_iteration(
-            pred, code, result, history, output_field_names, lm_metadata
+    def _copy_with_run_extract(self) -> PredictRLM:
+        run_ctx = current_run_context()
+        extract = (
+            run_ctx.state.get("extract", self.extract)
+            if run_ctx is not None
+            else self.extract
+        )
+        run_rlm = copy(self)
+        run_rlm.extract = extract
+        return run_rlm
+
+    def _extract_fallback_for_run(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        if not self._meter_extract_fallback(self._current_extract_fallback_state()):
+            return self._extract_fallback_skipped(
+                variables, history, output_field_names
+            )
+        run_rlm = self._copy_with_run_extract()
+        return run_rlm._extract_fallback(
+            variables,
+            history,
+            output_field_names,
+        )
+
+    async def _aextract_fallback_for_run(
+        self,
+        variables: list[Any],
+        history: Any,
+        output_field_names: list[str],
+    ) -> dspy.Prediction:
+        if not self._meter_extract_fallback(self._current_extract_fallback_state()):
+            return self._extract_fallback_skipped(
+                variables, history, output_field_names
+            )
+        run_rlm = self._copy_with_run_extract()
+        bound_fallback = getattr(run_rlm._extract_fallback, "__func__", None)
+        if bound_fallback is not _DSPY_EXTRACT_FALLBACK:
+            return run_rlm._extract_fallback(
+                variables,
+                history,
+                output_field_names,
+            )
+        return await run_rlm._aextract_fallback(
+            variables,
+            history,
+            output_field_names,
         )
 
     def _prepare_file_io(
@@ -2134,7 +4285,10 @@ class PredictRLM(dspy.RLM):
             return None, input_args
 
         file_plan = build_file_plan(
-            input_args, input_file_fields, output_file_fields, self._output_dir
+            input_args,
+            input_file_fields,
+            output_file_fields,
+            self._output_dir,
         )
         if not file_plan:
             return None, input_args
@@ -2177,24 +4331,51 @@ class PredictRLM(dspy.RLM):
         return file_plan, transformed
 
     def _setup_sandbox_files(
-        self, repl: PredictRLMInterpreter, file_plan: dict[str, Any]
+        self, repl: LegacyExecutionBackend, file_plan: dict[str, Any]
     ) -> None:
         """Mount input files, skill modules, and create output dirs in the sandbox."""
+        self._log_lifecycle(
+            "sandbox.files.setup.start",
+            backend=self._interpreter_backend_label(repl),
+            mounts=len(file_plan["mounts"]),
+            output_dirs=len(file_plan["output_dirs"]),
+            skill_modules=len(self._skill_modules),
+        )
         if hasattr(repl, "_ensure_deno_process"):
             repl._ensure_deno_process()
 
         for host_path, virtual_path in file_plan["mounts"]:
             repl.mount_file_at(host_path, virtual_path)
+            self._log_lifecycle(
+                "sandbox.files.mount",
+                backend=self._interpreter_backend_label(repl),
+                virtual_path=virtual_path,
+            )
 
         for virtual_dir in file_plan["output_dirs"]:
             repl.mkdir_p(virtual_dir)
+            self._log_lifecycle(
+                "sandbox.files.mkdir",
+                backend=self._interpreter_backend_label(repl),
+                virtual_path=virtual_dir,
+            )
 
         # Mount skill modules into /sandbox/lib/ so the RLM can import them
         if self._skill_modules:
             repl.mkdir_p("/sandbox/lib")
             for mod_name, host_path in self._skill_modules.items():
                 repl.mount_file_at(host_path, f"/sandbox/lib/{mod_name}.py")
+                self._log_lifecycle(
+                    "sandbox.files.skill_module_mount",
+                    backend=self._interpreter_backend_label(repl),
+                    module=mod_name,
+                    virtual_path=f"/sandbox/lib/{mod_name}.py",
+                )
             repl.execute("import sys; sys.path.insert(0, '/sandbox/lib')")
+        self._log_lifecycle(
+            "sandbox.files.setup.ok",
+            backend=self._interpreter_backend_label(repl),
+        )
 
         # Run skill setup code once, after modules are mounted and before the
         # first model block. Sandbox globals persist for the session, so this can
@@ -2205,7 +4386,7 @@ class PredictRLM(dspy.RLM):
 
     def _sync_output_files(
         self,
-        repl: PredictRLMInterpreter,
+        repl: LegacyExecutionBackend,
         prediction: dspy.Prediction,
         output_file_fields: dict[str, str],
         file_plan: dict[str, Any],
@@ -2216,6 +4397,11 @@ class PredictRLM(dspy.RLM):
         back to the host and replace the prediction value with File objects.
         """
         self._phase_log("sync_output_files:enter")
+        self._log_lifecycle(
+            "sandbox.files.sync_outputs.start",
+            backend=self._interpreter_backend_label(repl),
+            fields=len(output_file_fields),
+        )
         for field_name, kind in output_file_fields.items():
             info = file_plan["output_field_map"][field_name]
             host_dir = info["host_dir"]
@@ -2240,10 +4426,24 @@ class PredictRLM(dspy.RLM):
                     host_path = os.path.join(host_dir, basename)
                     os.makedirs(host_dir, exist_ok=True)
                     repl.sync_file_to(submitted_path, host_path)
+                    self._log_lifecycle(
+                        "sandbox.files.sync_output",
+                        backend=self._interpreter_backend_label(repl),
+                        field=field_name,
+                        virtual_path=submitted_path,
+                        host_path=host_path,
+                    )
                     setattr(prediction, field_name, File(path=host_path))
                 else:
                     # Fallback: list the output dir and sync everything
                     virtual_files = repl.list_dir(virtual_dir)
+                    self._log_lifecycle(
+                        "sandbox.files.list_output_dir",
+                        backend=self._interpreter_backend_label(repl),
+                        field=field_name,
+                        virtual_dir=virtual_dir,
+                        files=len(virtual_files),
+                    )
                     if virtual_files:
                         os.makedirs(host_dir, exist_ok=True)
                         for vpath in virtual_files:
@@ -2251,6 +4451,13 @@ class PredictRLM(dspy.RLM):
                             hp = os.path.join(host_dir, rel)
                             os.makedirs(os.path.dirname(hp), exist_ok=True)
                             repl.sync_file_to(vpath, hp)
+                            self._log_lifecycle(
+                                "sandbox.files.sync_output",
+                                backend=self._interpreter_backend_label(repl),
+                                field=field_name,
+                                virtual_path=vpath,
+                                host_path=hp,
+                            )
                         if len(virtual_files) == 1:
                             rel = os.path.relpath(virtual_files[0], virtual_dir)
                             hp = os.path.join(host_dir, rel)
@@ -2262,6 +4469,13 @@ class PredictRLM(dspy.RLM):
                 # Sync all files from the output dir, return list[File]
                 virtual_files = repl.list_dir(virtual_dir)
                 result_files: list[File] = []
+                self._log_lifecycle(
+                    "sandbox.files.list_output_dir",
+                    backend=self._interpreter_backend_label(repl),
+                    field=field_name,
+                    virtual_dir=virtual_dir,
+                    files=len(virtual_files),
+                )
                 if virtual_files:
                     os.makedirs(host_dir, exist_ok=True)
                     for vpath in virtual_files:
@@ -2269,8 +4483,19 @@ class PredictRLM(dspy.RLM):
                         hp = os.path.join(host_dir, rel)
                         os.makedirs(os.path.dirname(hp), exist_ok=True)
                         repl.sync_file_to(vpath, hp)
+                        self._log_lifecycle(
+                            "sandbox.files.sync_output",
+                            backend=self._interpreter_backend_label(repl),
+                            field=field_name,
+                            virtual_path=vpath,
+                            host_path=hp,
+                        )
                         result_files.append(File(path=hp))
                 setattr(prediction, field_name, result_files)
+        self._log_lifecycle(
+            "sandbox.files.sync_outputs.ok",
+            backend=self._interpreter_backend_label(repl),
+        )
 
     def _build_iteration_outcome(
         self,
@@ -2298,12 +4523,10 @@ class PredictRLM(dspy.RLM):
             entry = None
 
         full_output = entry.output if entry else ""
-        if len(full_output) > 5000:
-            prompt_output = (
-                full_output[:5000] + f"\n... (truncated to 5000/{len(full_output):,} chars)"
-            )
-        else:
-            prompt_output = full_output
+        prompt_output = _shorten_repl_output(full_output, self.max_output_chars)
+
+        predict_calls = drain_predict_calls()
+        iteration_usage = self._build_iteration_usage(predict_calls)
 
         return (
             IterationStep(
@@ -2312,11 +4535,12 @@ class PredictRLM(dspy.RLM):
                 code=entry.code if entry else "",
                 output=prompt_output,
                 untruncated_output=full_output,
-                error=full_output.startswith(("[Error]", "[Type Error]")),
+                error=_output_indicates_error(full_output),
                 duration_ms=ms_since(iter_start),
                 tool_calls=drain_tool_calls(),
-                predict_calls=drain_predict_calls(),
+                predict_calls=predict_calls,
                 lm=action_lm_metadata,
+                usage=iteration_usage,
             ),
             isinstance(result, dspy.Prediction),
         )
@@ -2351,34 +4575,6 @@ class PredictRLM(dspy.RLM):
             start_time_unix_nano=start_ns,
         )
         return True
-
-    def _run_extract_fallback(
-        self,
-        variables: list[Any],
-        history: Any,
-        output_field_names: list[str],
-        state: "_ExtractFallbackState",
-    ) -> dspy.Prediction:
-        """Metered + bounded sync max-iterations extract fallback."""
-        if not self._meter_extract_fallback(state):
-            return self._extract_fallback_skipped(
-                variables, history, output_field_names
-            )
-        return self._extract_fallback(variables, history, output_field_names)
-
-    async def _arun_extract_fallback(
-        self,
-        variables: list[Any],
-        history: Any,
-        output_field_names: list[str],
-        state: "_ExtractFallbackState",
-    ) -> dspy.Prediction:
-        """Async twin of :meth:`_run_extract_fallback`."""
-        if not self._meter_extract_fallback(state):
-            return self._extract_fallback_skipped(
-                variables, history, output_field_names
-            )
-        return await self._aextract_fallback(variables, history, output_field_names)
 
     def _extract_fallback_attrs(self, state: "_ExtractFallbackState") -> dict[str, Any]:
         return {
@@ -2415,20 +4611,19 @@ class PredictRLM(dspy.RLM):
             **outputs,
         )
 
-    def _begin_traced_run(
-        self, file_plan: dict[str, Any] | None, fb_bound: int | None
-    ) -> _TracedRun:
-        """Set up per-run state shared by ``forward()`` and ``aforward()``.
+    def _build_iteration_usage(self, predict_calls: list[Any]) -> LMUsage:
+        """Per-iteration usage: main action-LM call plus this turn's sub predict() calls."""
+        main = getattr(self, "_last_action_lm_usage", None) or TokenUsage()
+        self._last_action_lm_usage = None
+        sub = TokenUsage()
+        for group in predict_calls:
+            sub += group.total_usage
+        return LMUsage(main=main, sub=sub)
 
-        Swaps in file-aware signatures when there's a file plan (restored by
-        :meth:`_end_traced_run`), starts the run clock, and snapshots LM
-        history lengths so ``usage_since`` can take the delta at the end.
-        Per-RLM ``lm.copy()`` in ``__init__`` means each instance has its OWN
-        history, so concurrent runs don't cross-contaminate; DSPy's BaseLM
-        populates ``entry["cost"]`` from ``_hidden_params["response_cost"]``,
-        so ``usage_since`` returns LiteLLM-computed authoritative cost. No
-        ``track_usage`` context is needed.
-        """
+    def _forward_traced(
+        self, file_plan: dict[str, Any] | None, **input_args: Any
+    ) -> dspy.Prediction:
+        """Execute forward() with tracing and optional file I/O."""
         _, output_file_fields = scan_file_fields(self.signature) if file_plan else (None, {})
 
         orig_action, orig_extract = self.generate_action, self.extract
@@ -2439,285 +4634,410 @@ class PredictRLM(dspy.RLM):
 
         run_start = time.perf_counter()
         self._run_start = run_start  # anchor for _phase_log elapsed timings
+        self._seed_extract_fallback_state()
         lm = dspy.settings.lm
-        sub_lm = self._sub_lm
-        run = _TracedRun(
-            file_plan=file_plan,
-            output_file_fields=output_file_fields,
-            orig_action=orig_action,
-            orig_extract=orig_extract,
-            run_start=run_start,
-            # Per-forward extract-fallback metering — LOCAL state so concurrent
-            # (a)forwards on this instance don't race on a shared counter/budget.
-            fb_state=_ExtractFallbackState(
-                bound=self.max_extract_fallbacks if fb_bound is None else fb_bound
-            ),
-            lm=lm,
-            sub_lm=sub_lm,
-            lm_hist_start=snapshot_lm_history_len(lm),
-            sub_hist_start=(
-                snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
-            ),
-        )
+        sub_lm = self._active_sub_lm()
+        # Per-RLM instance ``lm`` has its own history (via ``lm.copy()``
+        # in ``__init__``) so these snapshots are isolated from other
+        # concurrent PredictRLM runs. No track_usage context needed —
+        # DSPy's BaseLM stamps cost and tokens into history on every call.
+        lm_hist_start = snapshot_lm_history_len(lm)
+        sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
+        steps: list[IterationStep] = []
         self._begin_telemetry_execution()
-        return run
 
-    def _end_traced_run(self, run: _TracedRun) -> None:
-        """Tear down what :meth:`_begin_traced_run` established."""
-        self._clear_telemetry_execution()
-        if run.file_plan:
-            self.generate_action, self.extract = run.orig_action, run.orig_extract
-
-    def _prepare_traced_execution(
-        self, run: _TracedRun, input_args: dict[str, Any]
-    ) -> tuple[list[str], list[Any], dict[str, Any]]:
-        """Validate inputs and build everything the REPL loop needs."""
-        self._validate_inputs(input_args)
-        output_field_names = list(self.signature.output_fields.keys())
-        execution_tools = self._prepare_execution_tools()
-        variables = self._build_variables(**input_args)
-        ctx_kwargs = (
-            dict(execution_tools=execution_tools, file_plan=run.file_plan)
-            if run.file_plan
-            else dict(execution_tools=execution_tools)
-        )
-        return output_field_names, variables, ctx_kwargs
-
-    def _begin_iteration_loop(self, run: _TracedRun, repl: Any) -> tuple[Any, str | None]:
-        """Mount sandbox files and reset partial-trajectory capture.
-
-        The reset is per-(a)forward so crash-recovery consumers (see e.g. the
-        spreadbench optimizer's ``_recover_partial_trace``) read the last
-        committed REPL state of THIS run if an iteration hangs or errors.
-        """
-        if run.file_plan:
-            self._setup_sandbox_files(repl, run.file_plan)
-
-        from dspy.primitives.repl_types import REPLHistory
-
-        history = REPLHistory()
-        self._partial_history = history
-        self._partial_pending_entry = None
-        self._partial_pending_start = None
-        return history, ACTIVE_CALL_ID.get()
-
-    @contextmanager
-    def _call_collector_scope(self) -> Iterator[None]:
-        """Collect predict/tool calls for the duration of one REPL loop."""
-        predict_token = init_predict_call_collector()
-        tool_token = init_tool_call_collector()
         try:
-            yield
-        finally:
-            reset_tool_call_collector(tool_token)
-            reset_predict_call_collector(predict_token)
+            self._validate_inputs(input_args)
+            output_field_names = list(self.signature.output_fields.keys())
+            execution_tools = self._prepare_execution_tools()
+            variables = self._build_variables(**input_args)
 
-    def _record_iteration_outcome(
-        self,
-        run: _TracedRun,
-        state: _IterationCallbackState,
-        result: Any,
-        history: Any,
-        iteration: int,
-        iter_start: float,
-    ) -> None:
-        """Turn one iteration's result into a trace step on ``run``."""
-        action_lm_metadata = getattr(self, "_last_action_lm_metadata", None)
-        self._last_action_lm_metadata = None
-        state.step, state.is_final = self._build_iteration_outcome(
-            result, history, iteration, iter_start, action_lm_metadata
-        )
-        run.steps.append(state.step)
-
-    def _finish_traced_run(
-        self, prediction: dspy.Prediction, run: _TracedRun, status: str, repl: Any
-    ) -> dspy.Prediction:
-        """Sync output files and attach the run trace to the prediction."""
-        if run.output_file_fields:
-            self._sync_output_files(
-                repl, prediction, run.output_file_fields, run.file_plan
-            )
-        prediction.trace = self._run_trace(run, status)
-        return prediction
-
-    def _attach_error_trace(self, exc: BaseException, run: _TracedRun) -> None:
-        """Best-effort trace on a failed run — never mask the original error."""
-        try:
-            exc.trace = self._run_trace(run, "error")
-        except Exception:
-            pass
-
-    def _run_trace(self, run: _TracedRun, status: str) -> Any:
-        return self._build_run_trace(
-            status=status,
-            steps=run.steps,
-            lm=run.lm,
-            sub_lm=run.sub_lm,
-            lm_hist_start=run.lm_hist_start,
-            sub_hist_start=run.sub_hist_start,
-            run_start=run.run_start,
-            extract_fallbacks=run.fb_state.count,
-        )
-
-    def _forward_traced(
-        self,
-        file_plan: dict[str, Any] | None,
-        *,
-        fb_bound: int | None = None,
-        **input_args: Any,
-    ) -> dspy.Prediction:
-        """Execute forward() with tracing and optional file I/O.
-
-        The await-bearing loop skeleton is the only thing that differs from
-        :meth:`_aforward_traced`; every other line is a call into a helper
-        the two share. Keep it that way — see tests/test_sync_async_parity.py.
-        """
-        run = self._begin_traced_run(file_plan, fb_bound)
-        try:
-            output_field_names, variables, ctx_kwargs = self._prepare_traced_execution(
-                run, input_args
+            ctx_kwargs = (
+                dict(execution_tools=execution_tools, file_plan=file_plan)
+                if file_plan
+                else dict(execution_tools=execution_tools)
             )
             with self._interpreter_context(**ctx_kwargs) as repl:
-                history, call_id = self._begin_iteration_loop(run, repl)
-                with self._call_collector_scope():
+                if file_plan:
+                    self._setup_sandbox_files(repl, file_plan)
+
+                from dspy.primitives.repl_types import REPLHistory
+
+                predict_token = init_predict_call_collector()
+                tool_token = init_tool_call_collector()
+
+                try:
                     status = "max_iterations"
+                    history = REPLHistory(max_output_chars=self.max_output_chars)
+                    pending_submit_confirmation = False
+                    # Reset partial-trajectory capture for this forward() call
+                    # so crash-recovery consumers (see e.g. the spreadbench
+                    # optimizer's _recover_partial_trace) can read the last
+                    # committed REPL state if an iteration hangs or errors.
+                    self._partial_history = history
+                    self._partial_pending_entry = None
+                    self._partial_pending_start = None
+                    self._trace_export_context = _TraceExportContext(
+                        steps=steps,
+                        lm=lm,
+                        sub_lm=sub_lm,
+                        lm_hist_start=lm_hist_start,
+                        sub_hist_start=sub_hist_start,
+                        run_start=run_start,
+                    )
+                    self._export_current_trace("in_progress")
+                    call_id = ACTIVE_CALL_ID.get()
+
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
                         with self._iteration_callback_scope(call_id, iteration) as state:
-                            result = self._execute_iteration(
-                                repl,
-                                variables,
+                            self._pending_submit_confirmation = pending_submit_confirmation
+                            try:
+                                result = self._execute_iteration(
+                                    repl,
+                                    variables,
+                                    history,
+                                    iteration,
+                                    input_args,
+                                    output_field_names,
+                                )
+                            finally:
+                                self._pending_submit_confirmation = False
+
+                            if isinstance(result, dspy.Prediction):
+                                confirmation_history = self._maybe_request_submit_confirmation(
+                                    prediction=result,
+                                    history=history,
+                                    input_args=input_args,
+                                    output_field_names=output_field_names,
+                                    iteration=iteration,
+                                    pending=pending_submit_confirmation,
+                                )
+                                if confirmation_history is not None:
+                                    result = confirmation_history
+                                    self._partial_history = confirmation_history
+                                    pending_submit_confirmation = True
+                                else:
+                                    pending_submit_confirmation = False
+                            elif pending_submit_confirmation:
+                                pending_submit_confirmation = False
+
+                            action_lm_metadata = getattr(
+                                self, "_last_action_lm_metadata", None
+                            )
+                            self._last_action_lm_metadata = None
+                            state.step, state.is_final = self._build_iteration_outcome(
+                                result,
                                 history,
                                 iteration,
-                                input_args,
-                                output_field_names,
+                                iter_start,
+                                action_lm_metadata,
                             )
-                            self._record_iteration_outcome(
-                                run, state, result, history, iteration, iter_start
-                            )
+                            steps.append(state.step)
+                            self._export_current_trace("in_progress")
 
                         if state.is_final:
                             status = "completed"
                             prediction = result
+                            if output_file_fields:
+                                self._sync_output_files(
+                                    repl, prediction, output_file_fields, file_plan
+                                )
                             break
                         history = result
                     else:
-                        prediction = self._run_extract_fallback(
-                            variables, history, output_field_names, run.fb_state
+                        prediction = self._extract_fallback_for_run(
+                            variables, history, output_field_names
                         )
+                        if output_file_fields:
+                            self._sync_output_files(
+                                repl, prediction, output_file_fields, file_plan
+                            )
 
-                    return self._finish_traced_run(prediction, run, status, repl)
+                    prediction.trace = self._build_run_trace(
+                        status=status,
+                        steps=steps,
+                        lm=lm,
+                        sub_lm=sub_lm,
+                        lm_hist_start=lm_hist_start,
+                        sub_hist_start=sub_hist_start,
+                        run_start=run_start,
+                    )
+                    self._export_run_trace(prediction.trace)
+                    return prediction
+                finally:
+                    reset_tool_call_collector(tool_token)
+                    reset_predict_call_collector(predict_token)
         except BaseException as exc:
-            self._attach_error_trace(exc, run)
+            try:
+                trace = self._build_run_trace(
+                    status="error",
+                    steps=steps,
+                    lm=lm,
+                    sub_lm=sub_lm,
+                    lm_hist_start=lm_hist_start,
+                    sub_hist_start=sub_hist_start,
+                    run_start=run_start,
+                )
+                setattr(exc, "trace", trace)
+                self._export_run_trace(trace)
+            except Exception:
+                pass
             raise
         finally:
-            self._end_traced_run(run)
+            self._clear_telemetry_execution()
+            self._trace_export_context = None
+            if file_plan:
+                self.generate_action, self.extract = orig_action, orig_extract
 
     async def _aforward_traced(
-        self,
-        file_plan: dict[str, Any] | None,
-        *,
-        fb_bound: int | None = None,
-        **input_args: Any,
+        self, file_plan: dict[str, Any] | None, **input_args: Any
     ) -> dspy.Prediction:
-        """Execute aforward() with tracing and optional file I/O.
+        """Execute aforward() with tracing and optional file I/O."""
+        _, output_file_fields = scan_file_fields(self.signature) if file_plan else (None, {})
 
-        Async twin of :meth:`_forward_traced` — identical modulo await.
-        """
-        run = self._begin_traced_run(file_plan, fb_bound)
+        run_ctx = current_run_context()
+
+        run_start = time.perf_counter()
+        self._run_start = run_start  # anchor for _phase_log elapsed timings
+        self._seed_extract_fallback_state()
+        lm = dspy.settings.lm
+        sub_lm = self._active_sub_lm()
+        # Snapshot lm.history lengths at run start so ``usage_since`` can
+        # sum the delta at end. Per-RLM ``lm.copy()`` in __init__ means
+        # each PredictRLM instance has its OWN history — concurrent runs
+        # don't cross-contaminate. DSPy's BaseLM populates
+        # ``entry["cost"]`` from ``_hidden_params["response_cost"]``, so
+        # ``usage_since`` returns LiteLLM-computed authoritative cost.
+        lm_hist_start = snapshot_lm_history_len(lm)
+        sub_hist_start = snapshot_lm_history_len(sub_lm) if sub_lm and sub_lm is not lm else 0
+        steps: list[IterationStep] = []
+        self._begin_telemetry_execution()
+
         try:
-            output_field_names, variables, ctx_kwargs = self._prepare_traced_execution(
-                run, input_args
-            )
-            with self._interpreter_context(**ctx_kwargs) as repl:
-                history, call_id = self._begin_iteration_loop(run, repl)
-                with self._call_collector_scope():
+            self._validate_inputs(input_args)
+            output_field_names = list(self.signature.output_fields.keys())
+            execution_tools = self._prepare_execution_tools()
+
+            async with self._execution_session(execution_tools=execution_tools) as repl:
+                if run_ctx is not None:
+                    await self._bind_runtime_inputs(run_ctx)
+                    await self._setup_runtime_modules(run_ctx)
+                    await self._reserve_runtime_outputs(run_ctx)
+                    input_args.update(
+                        {
+                            name: binding.prepared.model_value
+                            for name, binding in run_ctx.input_bindings.items()
+                        }
+                    )
+                    for field_name in run_ctx.output_reservations:
+                        input_args.pop(field_name, None)
+                    self._configure_run_predictors(run_ctx, None)
+                variables = self._build_variables(**input_args)
+
+                from dspy.primitives.repl_types import REPLHistory
+
+                predict_token = init_predict_call_collector()
+                tool_token = init_tool_call_collector()
+
+                try:
                     status = "max_iterations"
+                    history = REPLHistory(max_output_chars=self.max_output_chars)
+                    pending_submit_confirmation = False
+                    # Reset partial-trajectory capture for this aforward() call
+                    # so crash-recovery consumers (see e.g. the spreadbench
+                    # optimizer's _recover_partial_trace) can read the last
+                    # committed REPL state if an iteration hangs or errors.
+                    self._partial_history = history
+                    self._partial_pending_entry = None
+                    self._partial_pending_start = None
+                    self._trace_export_context = _TraceExportContext(
+                        steps=steps,
+                        lm=lm,
+                        sub_lm=sub_lm,
+                        lm_hist_start=lm_hist_start,
+                        sub_hist_start=sub_hist_start,
+                        run_start=run_start,
+                    )
+                    self._export_current_trace("in_progress")
+                    call_id = ACTIVE_CALL_ID.get()
+
                     for iteration in range(self.max_iterations):
                         iter_start = time.perf_counter()
-                        async with self._aiteration_callback_scope(call_id, iteration) as state:
-                            result = await self._aexecute_iteration(
-                                repl,
-                                variables,
+                        async with self._iteration_callback_scope_for_run(
+                            call_id, iteration
+                        ) as state:
+                            self._pending_submit_confirmation = pending_submit_confirmation
+                            try:
+                                result = await self._aexecute_iteration(
+                                    repl,
+                                    variables,
+                                    history,
+                                    iteration,
+                                    input_args,
+                                    output_field_names,
+                                )
+                            finally:
+                                self._pending_submit_confirmation = False
+
+                            if isinstance(result, dspy.Prediction):
+                                confirmation_history = self._maybe_request_submit_confirmation(
+                                    prediction=result,
+                                    history=history,
+                                    input_args=input_args,
+                                    output_field_names=output_field_names,
+                                    iteration=iteration,
+                                    pending=pending_submit_confirmation,
+                                )
+                                if confirmation_history is not None:
+                                    result = confirmation_history
+                                    self._partial_history = confirmation_history
+                                    pending_submit_confirmation = True
+                                else:
+                                    pending_submit_confirmation = False
+                            elif pending_submit_confirmation:
+                                pending_submit_confirmation = False
+
+                            action_lm_metadata = getattr(
+                                self, "_last_action_lm_metadata", None
+                            )
+                            self._last_action_lm_metadata = None
+                            state.step, state.is_final = self._build_iteration_outcome(
+                                result,
                                 history,
                                 iteration,
-                                input_args,
-                                output_field_names,
+                                iter_start,
+                                action_lm_metadata,
                             )
-                            self._record_iteration_outcome(
-                                run, state, result, history, iteration, iter_start
-                            )
+                            steps.append(state.step)
+                            recorder = self._evidence()
+                            if recorder is not None:
+                                await recorder.emit(
+                                    RunEventKind.ITERATION_RECORDED,
+                                    step=state.step.model_dump(mode="python"),
+                                )
+                            self._export_current_trace("in_progress")
 
                         if state.is_final:
                             status = "completed"
                             prediction = result
+                            if run_ctx is not None and run_ctx.output_reservations:
+                                await self._materialize_runtime_outputs(run_ctx, prediction)
                             break
                         history = result
                     else:
-                        prediction = await self._arun_extract_fallback(
-                            variables, history, output_field_names, run.fb_state
+                        prediction = await self._aextract_fallback_for_run(
+                            variables, history, output_field_names
                         )
+                        if run_ctx is not None and run_ctx.output_reservations:
+                            await self._materialize_runtime_outputs(run_ctx, prediction)
 
-                    return self._finish_traced_run(prediction, run, status, repl)
+                    prediction.trace = self._build_run_trace(
+                        status=status,
+                        steps=steps,
+                        lm=lm,
+                        sub_lm=sub_lm,
+                        lm_hist_start=lm_hist_start,
+                        sub_hist_start=sub_hist_start,
+                        run_start=run_start,
+                    )
+                    self._export_run_trace(prediction.trace)
+                    return prediction
+                finally:
+                    reset_tool_call_collector(tool_token)
+                    reset_predict_call_collector(predict_token)
         except BaseException as exc:
-            self._attach_error_trace(exc, run)
+            try:
+                trace = self._build_run_trace(
+                    status="error",
+                    steps=steps,
+                    lm=lm,
+                    sub_lm=sub_lm,
+                    lm_hist_start=lm_hist_start,
+                    sub_hist_start=sub_hist_start,
+                    run_start=run_start,
+                )
+                setattr(exc, "trace", trace)
+                self._export_run_trace(trace)
+            except Exception:
+                pass
             raise
         finally:
-            self._end_traced_run(run)
+            self._clear_telemetry_execution()
+            self._trace_export_context = None
+
 
     def _build_signatures_with_files(
         self, file_instructions: str
     ) -> tuple[dspy.Predict, dspy.Predict]:
-        """Build signatures with file instructions.
+        """Build signatures with per-call file instructions.
 
         File output fields are replaced with str in the signature so the RLM
         submits a path string, not a JSON object. The framework wraps the
         path in File after syncing.
         """
-        from .files import (
-            _is_list_annotation,
-            is_input_file_type,
-            is_output_file_type,
+        scoped_prompt_signature = _RUN_PROMPT_SIGNATURE.get()
+        prompt_signature = (
+            scoped_prompt_signature[1]
+            if scoped_prompt_signature is not None and scoped_prompt_signature[0] is self
+            else self.signature
         )
+        return self._build_signatures_for_prompt_signature(prompt_signature, file_instructions)
 
+    def _build_signatures_for_prompt_signature(
+        self,
+        prompt_signature: type[dspy.Signature],
+        file_instructions: str,
+    ) -> tuple[dspy.Predict, dspy.Predict]:
         # Replace file-typed fields with str/list[str] for the RLM's view
-        modified_sig = self.signature
-        for name, field in self.signature.output_fields.items():
-            if is_output_file_type(field.annotation):
-                replacement = list[str] if _is_list_annotation(field.annotation) else str
+        modified_sig = prompt_signature
+        for name, field in prompt_signature.output_fields.items():
+            descriptor = FieldDescriptor(name, field.annotation)
+            if descriptor.matches(File):
+                replacement = descriptor.replace_type(str)
                 modified_sig = modified_sig.with_updated_fields(
                     name,
                     desc=f"{field.json_schema_extra.get('desc', '')} "
                     f"(submit the sandbox path you wrote to)",
                     type_=replacement,
                 )
-        for name, field in self.signature.input_fields.items():
-            if is_input_file_type(field.annotation):
-                replacement = list[str] if _is_list_annotation(field.annotation) else str
+        for name, field in prompt_signature.input_fields.items():
+            descriptor = FieldDescriptor(name, field.annotation)
+            if descriptor.matches(File):
+                replacement = descriptor.replace_type(str)
                 modified_sig = modified_sig.with_updated_fields(
                     name,
                     desc=field.json_schema_extra.get("desc", ""),
                     type_=replacement,
                 )
 
-        raw_tools = {name: tool.func for name, tool in self._user_tools.items()}
+        raw_tools = self._runtime_tool_functions()
         action_sig, extract_sig = build_rlm_signatures(
             modified_sig,
             PREDICT_RLM_INSTRUCTIONS,
             raw_tools,
             self._format_tool_docs,
-            skill_instructions=self._skill_instructions,
+            skill_instructions=self._runtime_instructions(),
             file_instructions=file_instructions,
+            model_execution_timeout=self._model_execution_timeout,
+            max_output_chars=self.max_output_chars,
         )
         return dspy.Predict(action_sig), dspy.Predict(extract_sig)
 
     def _build_signatures(self) -> tuple[Signature, Signature]:
         """Build action and extract signatures with predict documentation."""
-        raw_tools = {name: tool.func for name, tool in self._user_tools.items()}
+        raw_tools = self._runtime_tool_functions()
         return build_rlm_signatures(
             self.signature,
             PREDICT_RLM_INSTRUCTIONS,
             raw_tools,
             self._format_tool_docs,
-            skill_instructions=self._skill_instructions,
+            skill_instructions=self._runtime_instructions(),
+            model_execution_timeout=self._model_execution_timeout,
+            max_output_chars=self.max_output_chars,
         )
+
+
+_KERNEL_FORWARD_TRACED = PredictRLM._forward_traced
+_KERNEL_AFORWARD_TRACED = PredictRLM._aforward_traced
+_KERNEL_EXECUTE_ITERATION = PredictRLM._execute_iteration

@@ -1,6 +1,7 @@
 """Run the document redaction example.
 
     uv run examples/document_redaction/run.py
+    uv run examples/document_redaction/run.py --quiet
     uv run examples/document_redaction/run.py --debug
     uv run examples/document_redaction/run.py /path/to/docs/
 
@@ -67,7 +68,12 @@ def parse_args():
     parser.add_argument(
         "--debug",
         action="store_true",
-        help="Print REPL code, output, errors, and tool calls to stderr",
+        help="Print timestamped RLM and sandbox lifecycle diagnostics to stderr",
+    )
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Suppress RLM reasoning, code, output, tool calls, errors, and submit blocks",
     )
     parser.add_argument(
         "--model",
@@ -151,7 +157,7 @@ async def main():
     redactor = DocumentRedactor(
         sub_lm=sub_lm,
         max_iterations=args.max_iterations,
-        verbose=True,
+        verbose=not args.quiet,
         debug=args.debug,
     )
     start_time = time.perf_counter()

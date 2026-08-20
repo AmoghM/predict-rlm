@@ -4,7 +4,19 @@ from unittest.mock import MagicMock, patch
 
 import dspy
 
-from predict_rlm._shared import build_rlm_signatures, format_tool_docs_full
+from predict_rlm._shared import (
+    build_rlm_signatures,
+    format_tool_docs_full,
+    strip_code_fences,
+)
+
+
+def test_strip_code_fences_accepts_supported_fences_and_bare_code():
+    assert strip_code_fences("```python\nprint('python')\n```") == "print('python')"
+    assert strip_code_fences("```py\nprint('py')\n```") == "print('py')"
+    assert strip_code_fences("```repl\nprint('repl')\n```") == "print('repl')"
+    assert strip_code_fences("```\nprint('bare fence')\n```") == "print('bare fence')"
+    assert strip_code_fences("print('bare code')") == "print('bare code')"
 
 
 class TestFormatToolDocsFull:
@@ -92,6 +104,52 @@ class TestBuildRlmSignatures:
         assert "variables_info" in extract.input_fields
         assert "repl_history" in extract.input_fields
         assert "answer" in extract.output_fields
+
+    def test_action_signature_exposes_optional_execution_timeout(self):
+        sig = dspy.Signature("question -> answer")
+        action, _ = build_rlm_signatures(
+            sig, self.ACTION_TEMPLATE, {}, format_tool_docs_full
+        )
+
+        timeout_field = action.output_fields.get("execution_timeout_seconds")
+        assert timeout_field is not None
+        assert timeout_field.default is None
+        assert not timeout_field.is_required()
+        assert type(None) in getattr(timeout_field.annotation, "__args__", ())
+        desc = timeout_field.json_schema_extra["desc"]
+        assert "Use null for ordinary short, safe code" in desc
+        assert "positive number of seconds" in desc
+        assert "loops" in desc
+        assert "large scans" in desc
+        assert "tool/network fanout" in desc
+        assert "batch predict() calls" in desc
+        assert "tests/subprocesses" in desc
+        assert "stdout/stderr" in desc
+        assert "next iteration can continue" in desc
+
+    def test_action_signature_omits_execution_timeout_when_disabled(self):
+        sig = dspy.Signature("question -> answer")
+        action, _ = build_rlm_signatures(
+            sig,
+            self.ACTION_TEMPLATE,
+            {},
+            format_tool_docs_full,
+            model_execution_timeout=False,
+        )
+
+        assert "execution_timeout_seconds" not in action.output_fields
+        assert "code" in action.output_fields  # other output fields unaffected
+
+    def test_action_signature_keeps_code_field_description_narrow(self):
+        sig = dspy.Signature("question -> answer")
+        action, _ = build_rlm_signatures(
+            sig, self.ACTION_TEMPLATE, {}, format_tool_docs_full
+        )
+
+        assert (
+            action.output_fields["code"].json_schema_extra["desc"]
+            == "Python code wrapped in ```repl blocks."
+        )
 
     def test_tool_docs_in_action_instructions(self):
         def my_tool(x: str) -> str:

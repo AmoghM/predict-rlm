@@ -73,6 +73,8 @@ from rlm_gepa.service import (
     prepare_run_dir,
 )
 
+pytestmark = pytest.mark.gepa
+
 
 class _DummyLM:
     model = "dummy/model"
@@ -1922,7 +1924,7 @@ def test_iteration_hard_count_transition_aligns_count_width(tmp_path: Path):
     rows = iteration_rows(tmp_path)
 
     assert rows[0]["hard: par → child"] == "0.260 → 0.180 -0.080; 13 →  9"
-    rendered = render_table(rows)
+    rendered = render_table(rows, width=120)
     plain_rendered = stats_report.re.sub(r"\033\[[0-9;]*m", "", rendered)
     assert ".260 → .180 -.080; 13 →  9" in plain_rendered
 
@@ -2085,7 +2087,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert rows[0]["p"] == "1.00"
     assert rows[0]["iter"] == "0 [0]"
     assert rows[0]["_highlight"] is True
-    iteration_terminal = render_table(rows)
+    iteration_terminal = render_table(rows, width=120)
     iteration_plain_lines = [
         stats_report.re.sub(r"\033\[[0-9;]*m", "", line) for line in iteration_terminal.splitlines()
     ]
@@ -2141,7 +2143,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
         "hard: par → child": " +0.500",
     }
     assert candidates[1]["_highlight"] is True
-    candidate_terminal = render_table(candidates)
+    candidate_terminal = render_table(candidates, width=120)
     assert "\033[38;5;178m0.500 → \033[0m\033[1;38;5;220m1.000\033[38;5;178m +0.500" in candidate_terminal
     costs = cost_rows(tmp_path)
     assert costs[0]["scope"] == "executor"
@@ -2186,7 +2188,7 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "| Δ-seed" in rendered
     assert "| ----" in rendered
     assert "**1 [0]**" in rendered
-    terminal = render_stats(tmp_path)
+    terminal = render_stats(tmp_path, width=120)
     assert "┌" in terminal
     assert "\033[3m" in terminal
     assert "\033[38;5;248m" in terminal
@@ -2204,6 +2206,15 @@ def test_reporting_tables_from_artifacts(tmp_path: Path):
     assert "eff" in terminal
     assert "costs (raw spend: all logged LM calls):" not in terminal
     assert "costs (deduped spend: stable operation ids only; legacy rows counted raw):" not in terminal
+
+
+def test_render_stats_before_state_checkpoint_does_not_crash(tmp_path: Path) -> None:
+    (tmp_path / "run_metadata.json").write_text(json.dumps({"project_name": "demo"}))
+
+    rendered = render_stats(tmp_path, table="all", output_format="markdown")
+
+    assert "iter=0" in rendered
+    assert "candidates=0" in rendered
 
 
 def test_candidate_rows_show_flips_against_each_parent(tmp_path: Path):
@@ -2233,7 +2244,7 @@ def test_candidate_rows_show_flips_against_each_parent(tmp_path: Path):
         "hard: par → child": " +0.333\n +0.333",
     }
 
-    rendered = render_table(rows)
+    rendered = render_table(rows, width=120)
 
     assert " -> " not in rendered
     assert "\033[38;5;178m.333 → \033[0m\033[1;38;5;220m.667\033[38;5;178m +.333" in rendered
@@ -2751,7 +2762,7 @@ def test_render_table_compacts_fractional_decimal_columns():
     ]
 
     markdown = render_table(rows, output_format="markdown")
-    terminal = render_table(rows, output_format="terminal")
+    terminal = render_table(rows, output_format="terminal", width=120)
 
     assert ".123" in markdown
     assert "+.045" in markdown
@@ -2835,6 +2846,7 @@ def test_apply_optimize_args_does_not_mutate_default_config():
         resume=False,
         cache=False,
         verbose_rlm=False,
+        debug_rlm=False,
         merge_proposer=True,
     )
 
@@ -2849,6 +2861,31 @@ class _TimeoutProject(_Project):
     async def evaluate_example(self, candidate, example, context):
         await asyncio.sleep(1)
         return RLMGepaExampleResult(score=1.0, feedback="ok", traces=[])
+
+
+class _ExampleTimeoutProject(_Project):
+    def task_timeout_for_example(self, example, default_timeout):
+        return 1
+
+    def task_resources_for_example(self, example):
+        return {"cpus": 2, "memory_mb": 4096}
+
+    async def evaluate_example(self, candidate, example, context):
+        await asyncio.sleep(0.02)
+        return RLMGepaExampleResult(
+            score=1.0,
+            feedback=f"timeout={context.task_timeout} resources={dict(context.task_resources)}",
+            traces=[
+                RunTrace(
+                    status="completed",
+                    model="test",
+                    iterations=1,
+                    max_iterations=1,
+                    duration_ms=1,
+                )
+            ],
+            example_id=str(example),
+        )
 
 
 class _ImmediateProject(_Project):
@@ -2972,6 +3009,38 @@ def test_adapter_progress_bar_labels_valset(tmp_path: Path, monkeypatch):
     )
 
 
+def test_adapter_caps_task_trace_filename_length(tmp_path: Path):
+    long_label = "long_evaluation_kind_with_nested_context_segments_and_repeated_observation_windows_001"
+    adapter = RLMGepaAdapter(
+        project=_ImmediateProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=1,
+        output_dir=tmp_path,
+        run_id=(
+            "synthetic-domain-neutral-task-with-extended-run-identifier-and-many-"
+            "descriptive-segments-for-trace-filename-stress-20260522-010041"
+        ),
+    )
+
+    batch = adapter.evaluate(
+        [long_label],
+        {"skill_instructions": "seed"},
+        capture_traces=False,
+        kind=long_label,
+    )
+
+    trace_files = list((tmp_path / "task_traces").glob("*.jsonl"))
+    assert batch.scores == [1.0]
+    assert len(trace_files) == 1
+    assert len(trace_files[0].name) < 255
+    row = json.loads(trace_files[0].read_text())
+    assert row["event_id"].endswith("attempt_0000")
+    assert row["kind"] == long_label
+
+
 def test_adapter_classifies_no_trace_repeat_batch_as_minibatch(tmp_path: Path, monkeypatch):
     import rlm_gepa.runtime.adapter as adapter_module
 
@@ -3057,9 +3126,11 @@ def test_adapter_progress_bar_uses_reflective_context(tmp_path: Path, monkeypatc
 class _ContextProject(_Project):
     def __init__(self):
         self.verbose_values: list[bool] = []
+        self.debug_values: list[bool] = []
 
     async def evaluate_example(self, candidate, example, context):
         self.verbose_values.append(context.verbose_rlm)
+        self.debug_values.append(context.debug_rlm)
         return RLMGepaExampleResult(
             score=1.0,
             feedback="",
@@ -3068,7 +3139,7 @@ class _ContextProject(_Project):
         )
 
 
-def test_adapter_propagates_verbose_rlm_to_every_example(tmp_path: Path):
+def test_adapter_propagates_rlm_logging_flags_to_every_example(tmp_path: Path):
     project = _ContextProject()
     adapter = RLMGepaAdapter(
         project=project,
@@ -3080,11 +3151,13 @@ def test_adapter_propagates_verbose_rlm_to_every_example(tmp_path: Path):
         output_dir=tmp_path,
         run_id="run_test",
         verbose_rlm=True,
+        debug_rlm=True,
     )
 
     adapter.evaluate(["a", "b"], {"skill_instructions": "seed"}, capture_traces=False)
 
     assert project.verbose_values == [True, True]
+    assert project.debug_values == [True, True]
 
 
 class _TelemetryProject(_Project):
@@ -3447,6 +3520,26 @@ def test_adapter_enforces_per_example_timeout(tmp_path: Path):
 
     assert batch.scores == [0.0]
     assert batch.trajectories[0]["record"]["Feedback"] == "evaluation timeout at 0.01s"
+
+
+def test_adapter_uses_project_timeout_and_resources_for_each_example(tmp_path: Path):
+    adapter = RLMGepaAdapter(
+        project=_ExampleTimeoutProject(),
+        lm=_DummyLM(),
+        sub_lm=_DummyLM(),
+        max_iterations=1,
+        concurrency=1,
+        task_timeout=0.01,
+        output_dir=tmp_path,
+        run_id="run_test",
+    )
+
+    batch = adapter.evaluate(["example"], {"skill_instructions": "seed"}, capture_traces=True)
+
+    assert batch.scores == [1.0]
+    assert batch.trajectories[0]["record"]["Feedback"] == (
+        "timeout=1 resources={'cpus': 2, 'memory_mb': 4096}"
+    )
 
 
 def test_adapter_prints_big_warning_for_evaluation_errors(tmp_path: Path, monkeypatch):
